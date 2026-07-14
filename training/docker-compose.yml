@@ -1,0 +1,17 @@
+# Training-side services (Mac). MLflow tracks experiments and stores model
+# artifacts; training code itself runs directly in a local venv for speed.
+services:
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    restart: unless-stopped
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflowdata:/mlflow
+
+volumes:
+  mlflowdata:

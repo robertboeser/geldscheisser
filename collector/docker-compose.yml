@@ -1,0 +1,70 @@
+# Collection stack. Runs in two places:
+#   - Raspberry Pi (archive of record): default settings, keeps everything.
+#   - Execution VPS (live features only): set GS_RETENTION_DAYS=90 in .env.
+#
+# From this directory:
+#   cp .env.example .env
+#   docker compose up -d --build
+#   docker compose run --rm backfill
+
+x-collector: &collector
+  build:
+    context: ..
+    dockerfile: collector/Dockerfile
+  restart: unless-stopped
+  env_file:
+    - path: ./.env
+      required: false
+  environment:
+    GS_DATABASE_URL: postgresql://gs:gs@timescaledb:5432/geldscheisser
+  depends_on:
+    timescaledb:
+      condition: service_healthy
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gs
+      POSTGRES_PASSWORD: gs
+      POSTGRES_DB: geldscheisser
+    ports:
+      # Reachable from the LAN so the training Mac can read the Pi's data.
+      - "5433:5432"
+    volumes:
+      - tsdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gs -d geldscheisser"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  klines:
+    <<: *collector
+    command: klines
+
+  orderbook:
+    <<: *collector
+    command: orderbook
+
+  aggtrades:
+    <<: *collector
+    command: aggtrades
+
+  futures:
+    <<: *collector
+    command: futures
+
+  monitor:
+    <<: *collector
+    command: monitor
+
+  backfill:
+    <<: *collector
+    command: backfill
+    restart: "no"
+    profiles: [backfill]
+
+volumes:
+  tsdata:
