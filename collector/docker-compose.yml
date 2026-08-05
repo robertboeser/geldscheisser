@@ -33,9 +33,12 @@ services:
       POSTGRES_PASSWORD: gs
       POSTGRES_DB: geldscheisser
     ports:
-      # Reachable so the archive (on the Pi) can pull from it — put both on
-      # Tailscale/WireGuard rather than exposing this publicly.
-      - "5433:5432"
+      # Bound to GS_BIND_ADDR (default 127.0.0.1: loopback-only, not reachable
+      # from off this host at all, not even the LAN). Once the archive needs
+      # to pull from here, set GS_BIND_ADDR in .env to this VPS's private
+      # Tailscale/WireGuard IP — never to 0.0.0.0 or a public IP. Compose
+      # reads GS_BIND_ADDR straight from ./.env for this substitution.
+      - "${GS_BIND_ADDR:-127.0.0.1}:5433:5432"
     volumes:
       - tsdata:/var/lib/postgresql/data
     healthcheck:
