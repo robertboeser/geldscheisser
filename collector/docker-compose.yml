@@ -1,6 +1,9 @@
-# Collection stack. Runs in two places:
-#   - Raspberry Pi (archive of record): default settings, keeps everything.
-#   - Execution VPS (live features only): set GS_RETENTION_DAYS=90 in .env.
+# Collection stack. Runs on a VPS with a reliable, low-latency connection —
+# an order book gap is unrecoverable, which makes home internet a poor place
+# for this specific service. Keeps a rolling GS_RETENTION_DAYS window (default
+# 90, enough for live features); the ../archive/ module (on the Pi) pulls
+# from here periodically and keeps everything, unbounded. The execution
+# service (phase 2/3) later runs on this same VPS, reading this same DB.
 #
 # From this directory:
 #   cp .env.example .env
@@ -30,7 +33,8 @@ services:
       POSTGRES_PASSWORD: gs
       POSTGRES_DB: geldscheisser
     ports:
-      # Reachable from the LAN so the training Mac can read the Pi's data.
+      # Reachable so the archive (on the Pi) can pull from it — put both on
+      # Tailscale/WireGuard rather than exposing this publicly.
       - "5433:5432"
     volumes:
       - tsdata:/var/lib/postgresql/data
