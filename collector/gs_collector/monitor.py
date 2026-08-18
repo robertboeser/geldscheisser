@@ -52,7 +52,9 @@ async def quality_report(pool, settings: Settings, alerter: Alerter) -> str:
     expected_total = actual_total = 0
     for sym in settings.symbols:
         for iv in settings.kline_intervals:
-            expected = 86_400_000 // INTERVAL_MS[iv]
+            # -1: the most recent candle in the window is still forming and can't
+            # possibly be closed (hence not yet in the DB) at report time — not a gap.
+            expected = 86_400_000 // INTERVAL_MS[iv] - 1
             actual = kline_counts.get((sym, iv), 0)
             expected_total += expected
             actual_total += actual
@@ -61,9 +63,13 @@ async def quality_report(pool, settings: Settings, alerter: Alerter) -> str:
     lines.append(f"klines: {actual_total:,}/{expected_total:,}")
 
     for table, ts_col, per_day, label in (
+        # book_rollups/snapshots are point-in-time inserts, not closed periods —
+        # no "still forming" row to account for, so their full grid count is correct.
         ("book_rollups", "ts", int(86_400 / settings.rollup_interval_s), "book rollups"),
         ("book_snapshots", "ts", int(86_400 / settings.snapshot_interval_s), "book snapshots"),
-        ("agg_trades_1m", "minute", 1440, "aggtrade minutes"),
+        # -1: same reasoning as klines — the current minute's bucket is only
+        # flushed once it fully elapses (see aggtrades.MinuteBuckets.pop_completed).
+        ("agg_trades_1m", "minute", 1440 - 1, "aggtrade minutes"),
     ):
         counts = {
             r["symbol"]: r["n"]

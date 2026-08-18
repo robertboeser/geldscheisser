@@ -46,27 +46,39 @@ Build a system that:
 
 Each box is an independent process/container so the collectors keep running while you iterate on models.
 
-## Deployment topology — three machines, three jobs
+## Deployment topology — four modules, four machines
 
-| Machine | Role | What runs there |
-|---|---|---|
-| **Raspberry Pi 4** (500GB SATA SSD, at home) | **Collection** — archive of record | TimescaleDB (keeps everything) + all collectors + monitor, 24/7 |
-| **Mac** | **Training** — research | Feature pipeline, labeling, LightGBM training, backtesting; MLflow for experiments/model registry |
-| **VPS** | **Execution** — live | Its own short-retention collector stack (`GS_RETENTION_DAYS=90`) + inference, signal engine, notifier; phase 3 adds the order executor + risk manager |
+| Machine | Module | Role | What runs there |
+|---|---|---|---|
+| **VPS** (cheap, reliable connection) | `collector` | **Collection** — live, rolling window | TimescaleDB (`GS_RETENTION_DAYS=90`) + all collectors + monitor, 24/7. Later shares this box with `execution`. |
+| **Raspberry Pi 4** (500GB SATA SSD, at home) | `archive` | **Archive** — permanent record | TimescaleDB (unbounded) + a sync job that pulls new rows from the collector VPS on a fixed interval (default weekly) |
+| **Mac** | `training` | **Training** — research | Feature pipeline, labeling, LightGBM training, backtesting; MLflow for experiments/model registry |
+| **VPS** (same box as `collector`) | `execution` | **Execution** — live | Reads the collector's own DB directly (no separate stack); inference, signal engine, notifier; phase 3 adds the order executor + risk manager |
+
+Why collection moved off the Pi: the order book collector is the one component where a gap
+is unrecoverable, so it belongs on whichever connection is actually reliable — a VPS, not
+home internet/power. The Pi's job becomes much less time-sensitive: a periodic batch pull
+tolerates the Pi being offline for a while, since the collector's 90-day window gives roughly
+13 weeks of buffer to catch up from if a sync is missed.
 
 Data flows:
 
-- **Pi → Mac:** the Mac reads the Pi's TimescaleDB over the LAN (or Tailscale) and snapshots
-  query results to local Parquet for fast repeated training runs. The Pi is never load-bearing
-  for anything except collection — a dead Pi loses future data, nothing else.
-- **Mac → VPS:** trained model artifacts ship via the MLflow registry (pull on deploy).
-- **VPS ⇄ Binance:** the VPS runs the *same* collector code as the Pi, but with a rolling
-  retention window — it needs feature lookback, not history. This keeps live trading
-  independent of the home network. Klines backfill instantly on first deploy; the VPS's own
-  order book rollups accumulate from day one of its deployment (start it well before phase 2
-  goes live so the model's book features have data).
-- The Pi's archive and the VPS's window never need to merge; both are produced by identical
-  code, which also guarantees train/live data has the same shape.
+- **collector → archive:** the Pi's `archive` service pulls new rows from the collector VPS
+  at a fixed interval (default 7 days) over a private network (Tailscale/WireGuard — never
+  expose the collector's Postgres publicly). Sync is keyset-paginated and idempotent, so
+  missed or partial runs just catch up next time; nothing is ever lost as long as a sync
+  happens within the 90-day window.
+- **archive → training:** the Mac reads the Pi's (unbounded) TimescaleDB over the LAN and
+  snapshots query results to local Parquet for fast repeated training runs. Training data is
+  therefore up to one sync interval (~1 week by default) behind live — fine for a monthly-ish
+  retraining cadence.
+- **training → execution:** trained model artifacts ship via the MLflow registry (pull on
+  deploy, hot-reload on new version).
+- **execution ⇄ collector:** since they share one machine and one database, execution simply
+  reads the collector's live data directly — no separate stack, no second retention window to
+  reason about.
+- Collector and archive run identical schema/code (`gs-common`), which is what guarantees
+  train/live data has the same shape regardless of which copy produced it.
 
 ## Tech stack (proposal)
 
@@ -95,14 +107,15 @@ Data flows:
 - Monorepo with one directory per deployment target, plus a shared library:
   ```
   common/       # gs-common: config, db schema, binance clients, alerting (installed everywhere)
-  collector/    # gs-collector: recorders + monitor + compose  → Raspberry Pi AND VPS
+  collector/    # gs-collector: recorders + monitor + compose  → VPS
+  archive/      # gs-archive: pulls from the collector on a fixed interval → Raspberry Pi
   training/     # gs-training: features, labels, training, backtest + MLflow compose → Mac
-  execution/    # gs-execution: inference, signals, notifier, trader → VPS
+  execution/    # gs-execution: inference, signals, notifier, trader → same VPS as collector
   ```
   Each part is its own Python package (`pip install ./common ./collector ...`), so every
-  machine installs only what it runs; `gs-execution` depends on `gs-collector` because the
-  VPS feeds itself.
-- Docker Compose per target (collector stack with TimescaleDB; MLflow on the Mac).
+  machine installs only what it runs.
+- Docker Compose per target (collector stack + TimescaleDB on the VPS; archive stack +
+  TimescaleDB on the Pi; MLflow on the Mac).
 - Structured logging + a heartbeat/health metric per collector (a dead collector must page you — a gap in order book data is unrecoverable).
 
 ### 0.2 Symbol universe
@@ -177,9 +190,9 @@ Alternatives to benchmark against: fixed-horizon return sign, trend-scanning lab
 
 **Deliverable: real-time messages like "BUY signal: SOLUSDT @ 142.30, P(win)=0.67, target +6.2%, stop −3.1%, expires in 14d" with full logging for forward-test evaluation.**
 
-Runs on the **VPS** against its own short-retention collector stack (see deployment
-topology) — deploy that stack early so live order book features have history when the
-first model goes live.
+Runs on the **collector VPS**, reading that same collector's data directly (see deployment
+topology) — deploy the collector stack early so live order book features have history when
+the first model goes live.
 
 ### 2.1 Inference service
 - Loop (event-driven on candle close, e.g. every 5m/1h depending on the model's decision timeframe):

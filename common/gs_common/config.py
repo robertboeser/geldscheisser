@@ -34,16 +34,22 @@ class Settings(BaseSettings):
     # Backfill
     backfill_start: date = date(2021, 1, 1)
 
-    # Data retention in days. 0 = keep everything (the Pi, archive of record).
-    # The execution VPS sets e.g. 90 — it only needs enough history to compute
-    # live features, not the full archive.
-    retention_days: int = 0
+    # Data retention in days. 0 = keep everything. The collector normally runs
+    # on the VPS with a rolling window (e.g. 90) — it only needs enough history
+    # for live features; the archive (unbounded) is the permanent record.
+    retention_days: int = 90
 
     # Health / monitoring
     heartbeat_interval_s: float = 30.0
     heartbeat_stale_s: float = 180.0
     quality_report_hour_utc: int = 6
     alert_cooldown_s: float = 1800.0
+
+    # Archive (Pi): pulls new rows from the collector at source_database_url
+    # into this machine's own (unbounded) database on a fixed interval.
+    source_database_url: str = ""
+    archive_sync_interval_s: float = 604_800.0  # 7 days — "every week or so"
+    archive_batch_size: int = 20_000
 
     @field_validator("symbols", "kline_intervals", mode="before")
     @classmethod
