@@ -5,40 +5,62 @@
 # from here periodically and keeps everything, unbounded. The execution
 # service (phase 2/3) later runs on this same VPS, reading this same DB.
 #
+# Network isolation: every service shares the `tailscale` container's network
+# namespace (network_mode: "service:tailscale") instead of publishing any
+# port on the host — see TAILSCALE.md for the full design. The only thing
+# ever reachable from outside this host at all is SSH.
+#
 # From this directory:
-#   cp .env.example .env
+#   cp .env.example .env               # set GS_DISCORD_WEBHOOK_URL and TS_AUTHKEY
 #   docker compose up -d --build
 #   docker compose run --rm backfill
+#   docker compose exec tailscale tailscale serve --bg --tcp=5432 tcp://localhost:5432   # once
 
 x-collector: &collector
   build:
     context: ..
     dockerfile: collector/Dockerfile
   restart: unless-stopped
+  network_mode: "service:tailscale"
   env_file:
     - path: ./.env
       required: false
   environment:
-    GS_DATABASE_URL: postgresql://gs:gs@timescaledb:5432/geldscheisser
+    GS_DATABASE_URL: postgresql://gs:gs@localhost:5432/geldscheisser
   depends_on:
+    tailscale:
+      condition: service_started
     timescaledb:
       condition: service_healthy
 
 services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: gs-collector
+    restart: unless-stopped
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY in .env — see TAILSCALE.md}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"   # kernel networking — needed for `tailscale serve --tcp`
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add: [NET_ADMIN, NET_RAW]
+
   timescaledb:
     image: timescale/timescaledb:latest-pg16
     restart: unless-stopped
+    network_mode: "service:tailscale"
+    depends_on:
+      tailscale:
+        condition: service_started
     environment:
       POSTGRES_USER: gs
       POSTGRES_PASSWORD: gs
       POSTGRES_DB: geldscheisser
-    ports:
-      # Bound to GS_BIND_ADDR (default 127.0.0.1: loopback-only, not reachable
-      # from off this host at all, not even the LAN). Once the archive needs
-      # to pull from here, set GS_BIND_ADDR in .env to this VPS's private
-      # Tailscale/WireGuard IP — never to 0.0.0.0 or a public IP. Compose
-      # reads GS_BIND_ADDR straight from ./.env for this substitution.
-      - "${GS_BIND_ADDR:-127.0.0.1}:5433:5432"
+    # No `ports:` section — nothing published to the host. Reachable at
+    # gs-collector:5432 over the tailnet once `tailscale serve` (above) is
+    # run, and from any other container here via localhost:5432.
     volumes:
       - tsdata:/var/lib/postgresql/data
     healthcheck:
@@ -75,3 +97,4 @@ services:
 
 volumes:
   tsdata:
+  tailscale-state:
