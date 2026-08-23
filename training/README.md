@@ -1,28 +1,104 @@
 # gs-training — research layer (runs on the Mac)
 
-Phase 1 of [the plan](../PLAN.md): feature pipeline, triple-barrier labeling,
-LightGBM baselines, walk-forward backtesting. Not built yet — starts once the
-Pi has accumulated a few weeks of order book rollups (kline-only research can
-start right after backfill).
+Phase 1 of [the plan](../PLAN.md). The **evaluation harness is built**:
+labeling, purged walk-forward splits, an event-driven backtester, metrics and
+baselines. The feature library and the model are not — deliberately, since a
+model you cannot honestly evaluate is worse than no model.
 
-Data access: reads the Pi's TimescaleDB directly over the LAN
-(`GS_DATABASE_URL=postgresql://gs:gs@<pi-host>:5433/geldscheisser`).
-Heavy experiments should snapshot query results to local Parquet first so
-repeated runs don't hammer the Pi.
+Kline history is [backfilled into the
+archive](../archive/README.md#backfill-history-into-the-archive) (2021 → now for
+1h/15m), so kline research can start now. Order book features join once the
+archive has accumulated a few weeks of rollups.
+
+Data access: reads the Pi's **archive** (not the live collector) over the LAN
+(`GS_DATABASE_URL=postgresql://gs:gs@<pi-host>:5433/geldscheisser`) — the
+archive holds unbounded history, while the collector itself only keeps a
+90-day rolling window. This also means training data lags live by up to one
+archive sync interval (1 day by default, `GS_ARCHIVE_SYNC_INTERVAL_S`) — fine
+for a monthly-ish retrain cadence, worth knowing if you ever want very recent
+data. Heavy experiments should snapshot query results to local Parquet first so
+repeated runs don't hammer the Pi (it is a USB2-attached SSD).
 
 Experiment tracking: `docker compose up -d` → MLflow at http://localhost:5001.
 Trained models are registered here and shipped to the execution VPS.
 
-Planned layout:
+## Layout
+
+Built (the evaluation harness — deliberately before any model, because
+"the backtest is the product"):
 
 ```
 gs_training/
-├── features.py   # shared feature library — the SAME code the VPS uses live
-├── labels.py     # triple-barrier labeling
-├── datasets.py   # Pi Postgres -> local parquet snapshots
-├── train.py      # LightGBM + walk-forward CV, logs to MLflow
-└── backtest.py   # event-driven simulation, fees/slippage
+├── datasets.py   # archive Postgres -> local parquet; aligned multi-symbol panel
+├── labels.py     # triple-barrier labeling, CUSUM event sampling, barrier scan
+├── splits.py     # purged + embargoed walk-forward, uniqueness weights
+├── backtest.py   # event-driven simulation: fees, slippage, capital, concurrency
+├── metrics.py    # profit factor, Sharpe/Sortino, drawdown + the stress tests
+└── baselines.py  # buy & hold, SMA cross, random-entry-same-exit control
 ```
+
+Not built yet:
+
+```
+├── features.py   # shared feature library — the SAME code the VPS uses live
+└── train.py      # LightGBM + walk-forward CV, calibration, logs to MLflow
+```
+
+## Using it
+
+```sh
+GS_DATABASE_URL=postgresql://gs:gs@gs-archive:5433/geldscheisser \
+  python -m gs_training.datasets --interval 1h --cache-dir data/parquet
+```
+
+Then label, split and backtest — see the worked example in
+[the harness section below](#what-the-harness-already-tells-you).
+
+## Three invariants the harness enforces
+
+1. **One barrier definition.** `BarrierSpec.barrier_prices` and `scan_barriers`
+   are used by *both* the labeller and the backtester. If they diverged, the
+   backtest would score a strategy the model was never trained on, and it would
+   look like a surprising result rather than a bug.
+2. **Nothing is labelled from data it could not have seen.** A signal at the
+   close of bar `i` fills at the open of `i+1`; barrier widths use volatility
+   known at `i`; a bar touching both barriers is a loss, because OHLC does not
+   record the intrabar path and assuming the good one invents money.
+3. **Equity equals starting cash plus realised P&L.** Asserted at the end of
+   every run. This is not decoration — it caught a real bug where a position
+   resolving inside its own entry bar was never booked, holding capital for the
+   rest of the run and leaking into equity as a mark that never became P&L. The
+   headline return said +39.5% while realised P&L was +145.
+
+## What the harness already tells you
+
+Running the baselines over 49,440 aligned 1h bars (2021-01 → 2026-08, 10 symbols,
++1.0σ/−0.5σ horizon-scaled barriers ≈ +14%/−7%, 14-day vertical, 0.1% taker fees
+and 5bps slippage each way):
+
+| strategy | trades | hit | return | profit factor | max DD |
+|---|---|---|---|---|---|
+| **buy & hold (equal weight)** | — | — | **+1084.5%** | — | — |
+| sma_cross 50/200 | 829 | 26.1% | −16.9% | 0.96 | 44.7% |
+| random entries (5 seeds) | ~1055 | ~25% | −14.8% … +48.5% | 0.97–1.10 | 24–51% |
+
+Read that carefully, because it is the whole reason this exists:
+
+- SMA cross **loses money**, and sits at the bottom of the random-entry band. It
+  has no edge; what looked like a strategy is the exit rule plus noise.
+- Every barrier strategy is annihilated by simply holding. In a sample where the
+  average symbol did +1084%, beating buy & hold — not beating zero — is the bar.
+- The random-entry spread is **63 points wide** across five seeds with identical
+  logic. Any single backtest result inside that band is indistinguishable from
+  luck, which is what ~1,456 effectively independent samples buys you.
+
+## Sample budget
+
+78,837 labelled events sounds like plenty and is not. A 14-day horizon on 1h bars
+overlaps ~336-fold, so `average_uniqueness` puts the effective independent count
+at **~1,456** — matching the analytic estimate of 49,440 bars ÷ 336 × 10 symbols.
+Those weights belong in `sample_weight` when training; treating 78,837 correlated
+rows as 78,837 observations is how a model overfits while its metrics look fine.
 
 The feature library must stay importable by `gs-execution` — one code path for
 training and live inference is what prevents train/serve skew.

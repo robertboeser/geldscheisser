@@ -1,5 +1,5 @@
-# Phase 1 (runs on the Mac). Research deps (polars, lightgbm, mlflow, ...) land
-# here once feature/label/backtest work starts.
+# Phase 1 (runs on the Mac). Model deps (lightgbm, mlflow) land here once the
+# modelling work starts; the evaluation harness needs only arrays and parquet.
 [project]
 name = "gs-training"
 version = "0.1.0"
@@ -7,7 +7,19 @@ description = "Geldscheißer research: features, labeling, model training, backt
 requires-python = ">=3.11"
 dependencies = [
     "gs-common",
+    "numpy>=2",
+    "polars>=1",
+    "pyarrow>=17",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+gs-datasets = "gs_training.datasets:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -15,3 +27,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gs_training"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

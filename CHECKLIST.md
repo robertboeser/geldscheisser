@@ -236,16 +236,46 @@ continuous order book rollups in the archive before book features join the model
 ## Phase 1 — Training (Mac, `training/`)
 
 - [ ] MLflow up (`cd training && docker compose up -d`)
-- [ ] Dataset export: archive Postgres → local Parquet snapshots (`datasets.py`)
+- [x] Dataset export: archive Postgres → local Parquet snapshots (`datasets.py`),
+      plus `load_panel` for an inner-joined multi-symbol bar grid. Read-only by
+      construction: connects with raw asyncpg rather than `gs_common.create_pool`,
+      which would apply schema DDL to the archive of record.
 - [ ] Feature library (`features.py`) — multi-timeframe price/trend/volume features
 - [ ] Order book features from rollups (spread/imbalance/depth trends)
 - [ ] Cross-market features (BTC regime, funding, open interest)
-- [ ] Triple-barrier labeling (`labels.py`), volatility-scaled targets, pluggable
-- [ ] Baselines: buy-and-hold, SMA cross, random-entry-same-exit
+- [x] Triple-barrier labeling (`labels.py`), volatility-scaled targets, CUSUM event
+      sampling. Volatility is scaled to the holding period (`sigma·sqrt(max_bars)`) —
+      feeding a per-bar sigma into a 336-bar horizon put the barriers ~18x too close,
+      so nothing ever reached the vertical barrier and the labels silently described
+      scalping rather than swing trading.
+- [x] Baselines: buy-and-hold, SMA cross, random-entry-same-exit (`baselines.py`)
 - [ ] LightGBM classifier + calibrated probabilities
-- [ ] Walk-forward validation with purge + embargo (no random splits!)
-- [ ] Event-driven backtester: fees, slippage, barrier exits (`backtest.py`)
-- [ ] Stress tests: 2× fees, 1-candle entry delay, drop best 5 trades
+- [x] Walk-forward validation with purge + embargo (`splits.py`), plus
+      `assert_no_leakage` (called per fold in every experiment) and
+      `average_uniqueness` for overlap-aware sample weights
+- [x] Event-driven backtester: fees, slippage, barrier exits, capital and
+      concurrency limits (`backtest.py`). Exits go through the *same*
+      `scan_barriers` the labeller uses, so the backtest cannot drift from the
+      training target.
+- [x] Stress tests: 2× fees, 1-candle entry delay, drop best 5 trades (`metrics.py`)
+- [x] Harness unit tests — 48 passing, covering the pessimism choices (same-bar
+      double touch = loss, gaps through the stop fill at the open, no fill on the
+      decision bar) and the leakage guarantees
+- [x] **Fixed a backtest accounting bug** (2026-08-23), caught by cross-checking two
+      numbers that must agree: the run reported `total_return=+39.5%` while realised
+      P&L was `+145`. A position whose barrier resolved inside its own entry bar was
+      appended to `open_trades` *after* that bar's close-out step, so it never closed —
+      it held capital for the rest of the run and leaked into equity as an unrealised
+      mark that never became P&L. Fixed by settling same-bar resolutions inline, and
+      `run_backtest` now raises if any position is still open at the final bar.
+      Correcting it flipped `sma_cross` from +39.5% to −16.9%.
+
+**First real finding (2026-08-23), before any model exists:** over 49,440 aligned 1h
+bars, `sma_cross 50/200` returns −16.9% (PF 0.96) and sits at the *bottom* of the
+random-entry band (−14.8% … +48.5% across 5 seeds), while equal-weight buy & hold
+returns +1084.5%. The 63-point spread between identical-logic random seeds is the
+number to keep in mind: any single backtest result inside that band is luck, which is
+what ~1,456 effectively independent samples buys.
 - [ ] Experiment log in MLflow; untouched final holdout period reserved
 
 **Gate → phase 2:** walk-forward backtest beats baselines net of fees across

@@ -10,7 +10,7 @@ The project is split by deployment target — four modules, four machines:
 | [common/](common/) | `gs-common` | everywhere | Config, DB schema, Binance clients, alerting |
 | [collector/](collector/) | `gs-collector` | **VPS** | 24/7 market-data collection into a rolling TimescaleDB window |
 | [archive/](archive/) | `gs-archive` | **Raspberry Pi** | Pulls the collector's data on a fixed interval into an unbounded local copy |
-| [training/](training/) | `gs-training` | **Mac** | Phase 1: features, labels, model training, backtests (reads the archive) |
+| [training/](training/) | `gs-training` | **Mac** | Phase 1: labeling, walk-forward, backtester (built); features + model (next) |
 | [execution/](execution/) | `gs-execution` | **same VPS as collector** | Phase 2/3: inference, signals, auto-trading (reads the collector directly) |
 
 **Current state: Phase 0** — the collection and archive stacks are built and verified:
@@ -141,7 +141,7 @@ why `GS_ARCHIVE_BATCH_SIZE` is lowered on a 4GB Pi.
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -e common -e 'collector[dev]' -e 'archive[dev]'
-.venv/bin/pytest common/tests collector/tests archive/tests   # unit tests
+.venv/bin/pytest common/tests collector/tests archive/tests training/tests   # unit tests
 .venv/bin/gs orderbook                           # run a collector service against GS_DATABASE_URL
 ```
 
