@@ -22,7 +22,7 @@ The project is split by deployment target — four modules, four machines:
 | `aggtrades` | collector | Per-minute taker buy/sell flow |
 | `futures` | collector | Funding rates (with full backfill) + open interest from USDT perps |
 | `monitor` | collector | Heartbeat watchdog + daily data-quality report → Discord |
-| `backfill` | collector | One-shot kline history loader (data.binance.vision dumps + REST top-up) |
+| `backfill` | collector | One-shot kline history loader (data.binance.vision dumps + REST top-up); gap-filling, so it also runs against the archive |
 | `sync` | archive | Pulls new rows from the collector into an unbounded local archive (default daily) |
 
 ## Why collection and archive are on different machines
@@ -45,7 +45,7 @@ logging into the VPS for routine deploys.
 git clone <this-repo> && cd geldscheisser/collector
 cp .env.example .env               # set GS_DISCORD_WEBHOOK_URL and TS_AUTHKEY
 docker compose up -d --build       # TimescaleDB (90-day window) + all collectors, 24/7
-docker compose run --rm backfill   # kline history (resumable, re-run any time)
+docker compose run --rm backfill   # kline history for the 90-day window (re-run any time)
 docker compose exec tailscale tailscale serve --bg --tcp=5432 tcp://localhost:5432   # once
 ```
 
@@ -55,6 +55,13 @@ Check on it:
 docker compose logs -f orderbook
 docker compose run --rm klines quality    # ad-hoc data-quality report
 ```
+
+> **Backfilling the collector only fills its 90-day window.** That is all the
+> live features need. Multi-year history for training goes into the *archive*
+> instead — see [Backfill history into the archive](archive/README.md#backfill-history-into-the-archive).
+> Pointing the backfill at the collector and expecting the archive to inherit
+> the history does not work: retention drops the old chunks, and the archive's
+> sync is forward-only.
 
 > **Why the collectors must stay up:** candle history can always be re-downloaded,
 > but order book data only exists if you record it live. Gaps are unrecoverable.
@@ -134,7 +141,7 @@ why `GS_ARCHIVE_BATCH_SIZE` is lowered on a 4GB Pi.
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -e common -e 'collector[dev]' -e 'archive[dev]'
-.venv/bin/pytest collector/tests archive/tests   # unit tests
+.venv/bin/pytest common/tests collector/tests archive/tests   # unit tests
 .venv/bin/gs orderbook                           # run a collector service against GS_DATABASE_URL
 ```
 

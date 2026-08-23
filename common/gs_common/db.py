@@ -133,7 +133,14 @@ _HYPERTABLES = ["klines", "book_rollups", "book_snapshots", "agg_trades_1m"]
 
 
 def _retention_statements(retention_days: int) -> list[str]:
-    """Short-retention mode for the execution VPS; the Pi (0) keeps everything."""
+    """Short-retention mode for the execution VPS; the Pi (0) keeps everything.
+
+    `None` (see `ensure_schema`) is a third state: leave the existing policies
+    alone. A one-shot job pointed at someone else's database has no business
+    redefining how long that database keeps data — `gs backfill` run against the
+    unbounded archive with the default 90 would otherwise attach a retention
+    policy that silently drops the very history it just wrote.
+    """
     if retention_days > 0:
         return [
             f"SELECT add_retention_policy('{t}', INTERVAL '{retention_days} days', if_not_exists => TRUE)"
@@ -142,13 +149,14 @@ def _retention_statements(retention_days: int) -> list[str]:
     return [f"SELECT remove_retention_policy('{t}', if_exists => TRUE)" for t in _HYPERTABLES]
 
 
-async def create_pool(settings: Settings) -> asyncpg.Pool:
+async def create_pool(settings: Settings, manage_retention: bool = True) -> asyncpg.Pool:
+    """Long-running services own their retention policy; batch jobs pass False."""
     pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=5)
-    await ensure_schema(pool, settings.retention_days)
+    await ensure_schema(pool, settings.retention_days if manage_retention else None)
     return pool
 
 
-async def ensure_schema(pool: asyncpg.Pool, retention_days: int = 0) -> None:
+async def ensure_schema(pool: asyncpg.Pool, retention_days: int | None = 0) -> None:
     async with pool.acquire() as conn:
         # Serialize concurrent service startups.
         await conn.execute("SELECT pg_advisory_lock(815001)")
@@ -156,7 +164,8 @@ async def ensure_schema(pool: asyncpg.Pool, retention_days: int = 0) -> None:
             for stmt in _TABLES:
                 await conn.execute(stmt)
             timescale_ok = True
-            for stmt in _TIMESCALE + _retention_statements(retention_days):
+            retention = [] if retention_days is None else _retention_statements(retention_days)
+            for stmt in _TIMESCALE + retention:
                 try:
                     await conn.execute(stmt)
                 except asyncpg.PostgresError as e:

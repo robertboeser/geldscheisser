@@ -31,8 +31,12 @@ class Settings(BaseSettings):
     rollup_interval_s: float = 10.0    # book_rollups cadence
     snapshot_interval_s: float = 300.0 # book_snapshots cadence
 
-    # Backfill
+    # Backfill. `backfill_start` is the default earliest month to pull; the
+    # override map lets fine intervals stop earlier, e.g.
+    # GS_BACKFILL_START_OVERRIDES="1m:2025-09-01,5m:2025-09-01" — a 14-day swing
+    # horizon does not need minute candles from 2021, and they dominate row count.
     backfill_start: date = date(2021, 1, 1)
+    backfill_start_overrides: Annotated[dict[str, date], NoDecode] = {}
 
     # Data retention in days. 0 = keep everything. The collector normally runs
     # on the VPS with a rolling window (e.g. 90) — it only needs enough history
@@ -58,10 +62,30 @@ class Settings(BaseSettings):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
 
+    @field_validator("backfill_start_overrides", mode="before")
+    @classmethod
+    def _parse_start_overrides(cls, v):
+        """Parse `1m:2025-09-01,5m:2025-09-01` into {interval: date}."""
+        if not isinstance(v, str):
+            return v
+        out = {}
+        for item in v.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            interval, _, day = item.partition(":")
+            if not day:
+                raise ValueError(f"expected 'interval:YYYY-MM-DD', got {item!r}")
+            out[interval.strip()] = date.fromisoformat(day.strip())
+        return out
+
     @field_validator("symbols")
     @classmethod
     def _upper(cls, v: list[str]) -> list[str]:
         return [s.upper() for s in v]
+
+    def backfill_start_for(self, interval: str) -> date:
+        return self.backfill_start_overrides.get(interval, self.backfill_start)
 
 
 def load_settings() -> Settings:

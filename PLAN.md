@@ -71,8 +71,10 @@ Data flows:
   happens within the 90-day window.
 - **archive → training:** the Mac reads the Pi's (unbounded) TimescaleDB over the LAN and
   snapshots query results to local Parquet for fast repeated training runs. Training data is
-  therefore up to one sync interval (~1 week by default) behind live — fine for a monthly-ish
-  retraining cadence.
+  therefore up to one sync interval (1 day by default) behind live — fine for a monthly-ish
+  retraining cadence. Multi-year candle history is loaded straight into the archive rather
+  than inherited from the collector: retention drops the collector's old chunks, and the
+  sync only ever moves forward from the archive's newest row.
 - **training → execution:** trained model artifacts ship via the MLflow registry (pull on
   deploy, hot-reload on new version).
 - **execution ⇄ collector:** since they share one machine and one database, execution simply

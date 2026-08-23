@@ -56,6 +56,10 @@ services:
         required: false
     environment:
       GS_DATABASE_URL: postgresql://gs:gs@timescaledb:5432/geldscheisser
+      # The archive's defining property: unbounded. gs-common defaults to 90
+      # (right for the collector), so state 0 here rather than inheriting it —
+      # `environment` also wins over .env, so it cannot be lost with that file.
+      GS_RETENTION_DAYS: "0"
     depends_on:
       timescaledb:
         condition: service_healthy

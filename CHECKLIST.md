@@ -10,7 +10,7 @@ between phases are the important part, don't skip them.
 - [x] Settings via `GS_*` env / `.env` (symbols, intervals, cadences, retention)
 - [x] TimescaleDB schema: hypertables, compression policies, optional retention (`GS_RETENTION_DAYS`)
 - [x] Kline collector (1m/5m/15m/1h websocket, closed candles only)
-- [x] Kline backfill (data.binance.vision monthly dumps + REST top-up, resumable)
+- [x] Kline backfill (data.binance.vision monthly dumps + REST top-up, gap-filling)
 - [x] Order book collector (snapshot+diff sync, gap detection, auto-resync)
 - [x] Order book rollups every 10s (spread, depth, imbalance at 10/50/100/200 bps)
 - [x] Order book snapshots every 5min (top 500 levels/side)
@@ -39,6 +39,27 @@ between phases are the important part, don't skip them.
       front and chosen per page. The suite missed it because the test fake ignored the SQL and
       read the cursor from `*args`; it now asserts placeholder count matches arg count, which
       makes 4 existing tests fail against the old code.
+- [x] **Fixed backfill being unable to fill history under live data** (2026-08-23), found
+      when scoping phase 1: `backfill_pair` resumed from `MAX(open_time)`, so once the live
+      collector was running the resume point was always "now" — `complete_months(today, today)`
+      is empty and the REST cursor started at the present. A re-run therefore fetched **nothing
+      and logged success**. Everything below the newest row was unreachable, which on a database
+      whose old chunks had been dropped by retention meant all history. Compounding it, the
+      archive's sync is forward-only (`WHERE (open_time, symbol, interval) > watermark`), so even
+      a correctly backfilled collector could never hand that history to the Pi. Now every complete
+      month in the window is checked against its expected candle count and re-fetched if short —
+      backward fill, mid-history gaps, and cheap no-op re-runs all fall out of the same rule.
+      Related fixes in the same pass:
+      · counts reported are rows *inserted* (from the INSERT command tag), not rows downloaded —
+        a backfill that overstates its work is the failure mode this module exists to prevent
+      · `GS_BACKFILL_START_OVERRIDES="1m:...,5m:..."` so fine intervals need not reach 2021
+      · staging via `COPY` + `INSERT .. SELECT .. ON CONFLICT` instead of `executemany`
+        (~3,000 rows/s vs the ~850 measured on the first Pi sync)
+      · `create_pool(manage_retention=False)` for batch jobs — `gs backfill` pointed at the
+        archive with the gs-common default of 90 would have attached a retention policy to the
+        unbounded database and dropped the history it had just written
+      · `GS_RETENTION_DAYS: "0"` pinned in `archive/docker-compose.yml` so the archive's
+        defining property is stated at the deploy site, not inherited
 
 ### Deployment — collector (VPS)
 - [x] VPS provisioned: Docker + Compose v2.24+
@@ -53,7 +74,8 @@ between phases are the important part, don't skip them.
       TCP connect succeeds, `tailscale serve status` shows tailnet-only, not funnel)
 - [x] Confirmed unreachable on the public IP (2026-08-19: both old port 5433 and 5432 time
       out against the VPS's public IP; only SSH/22 responds)
-- [ ] Kline backfill completed (2021 → now, all symbols/intervals)
+- [x] Kline backfill of the collector's own 90-day window (all it needs for live
+      features — multi-year history lives in the archive instead, see below)
 - [ ] Test alert received (stop a collector, watchdog fires within ~3 min)
 - [ ] Coverage ≥99% sustained for one full week (post quality-report fix)
 - [ ] Collectors auto-recover after VPS reboot (`restart: unless-stopped` verified)
@@ -141,6 +163,9 @@ between phases are the important part, don't skip them.
 - [ ] **Consider a USB3 bridge.** The JM20329 is USB2-only: measured 37.7 MB/s, which is why
       the first full sync takes hours. Fine for a daily delta; an ASM1153E/JMS578 enclosure
       would be a strict upgrade.
+- [ ] **Multi-year kline history loaded into the archive** (2021 → now for 1h/15m,
+      ~1 year for 1m/5m) — the actual phase-1 training set. Verify per-month counts are
+      complete and the series is contiguous, not just that row counts grew.
 - [ ] Archive survives a missed sync window (stop it a few days, verify catch-up on restart)
 - [ ] Backup story for the SSD decided (even rsync of weekly pg_dump is fine)
 - [ ] Consider retry-with-backoff on a failed sync: `sync_loop` sleeps the full interval after
@@ -149,8 +174,9 @@ between phases are the important part, don't skip them.
       loss, and the Discord alert fires. A few short retries before falling back to the daily
       cadence would make it self-healing.
 
-**Gate → phase 1:** klines backfilled (research can start now) · ≥4–8 weeks
-of continuous order book rollups in the archive before book features join the model.
+**Gate → phase 1:** klines backfilled *into the archive* (research can start once
+that lands — the collector's own window is not the training set) · ≥4–8 weeks of
+continuous order book rollups in the archive before book features join the model.
 
 ## Phase 1 — Training (Mac, `training/`)
 

@@ -22,6 +22,45 @@ crash mid-sync) is safe: `sync_table` in [gs_archive/sync.py](gs_archive/sync.py
 just picks up where the local data already ends. Inserts use
 `ON CONFLICT DO NOTHING` — the archive is a straight copy, never a live merge.
 
+## Backfill history into the archive
+
+The sync job only ever moves data *forward*: it resumes from the archive's own
+newest row and pulls what is greater than it. That is the right behaviour for a
+tail-follower, but it means history older than the archive's watermark can never
+arrive that way — and the collector cannot supply it either, because its 90-day
+retention drops those chunks long before a daily sync would see them.
+
+So multi-year candle history is loaded **directly into the archive**, from the
+Mac, over the tailnet:
+
+```sh
+cd geldscheisser
+GS_DATABASE_URL=postgresql://gs:gs@gs-archive:5433/geldscheisser \
+GS_BACKFILL_START=2021-01-01 \
+GS_BACKFILL_START_OVERRIDES="1m:2025-09-01,5m:2025-09-01" \
+  python -m gs_collector backfill
+```
+
+Notes:
+
+- **It fills gaps, it does not append.** Every complete month in the window is
+  compared against the candle count that month should hold and re-fetched if it
+  is short, so this works against a database that already holds live data —
+  backward fill and mid-history holes both. A fully-populated database re-runs
+  in seconds and reports `+0 candles`; the count is rows actually inserted, not
+  rows downloaded.
+- **`GS_BACKFILL_START_OVERRIDES` keeps the fine intervals cheap.** A 14-day
+  swing horizon does not need minute candles from 2021, and they would be ~60%
+  of all rows. 1h/15m go back to 2021; 1m/5m cover roughly the last year. The
+  window is trivially extended later by re-running with an earlier date.
+- **It will not touch the retention policy.** `gs backfill` opens its pool with
+  `manage_retention=False`, so it cannot attach the gs-common default of 90 days
+  to this unbounded database — which would otherwise silently drop the history
+  it had just written.
+- Run it from the Mac, not the Pi: the download is the Mac's bandwidth and the
+  Pi only sees the COPY stream. Measured ~3,000 rows/s end to end over the
+  tailnet against the USB2 SSD.
+
 ## Deploy
 
 **As built:** Raspberry Pi 4 Model B (4GB), Debian 13 (trixie) arm64, booting
