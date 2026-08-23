@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -156,3 +157,58 @@ class TestTableConfigConsistency:
     @pytest.mark.parametrize("table", TABLES, ids=lambda t: t.name)
     def test_conflict_cols_are_a_subset_of_select_cols(self, table):
         assert set(table.conflict_cols) <= set(table.select_cols)
+
+
+class TestLateArrivingRows:
+    """Rows whose timestamp sorts below the watermark but are inserted after it.
+
+    klines is the case that bites: a 15m candle is written when it closes, a
+    quarter hour after its own open_time, by which time 1m candles have already
+    pushed the watermark past it. Without a lookback the forward-only walk skips
+    it forever."""
+
+    def _kline(self, open_time, symbol="BTCUSDT", interval="1m"):
+        table = find_table("klines")
+        return {c: 0.0 for c in table.select_cols} | {
+            "open_time": open_time, "symbol": symbol, "interval": interval}
+
+    async def test_late_coarse_candle_is_lost_without_lag(self):
+        table = find_table("klines")
+        base = datetime(2026, 8, 23, 13, 0, tzinfo=timezone.utc)
+        # Archive already synced 1m candles up to 13:44.
+        already = [self._kline(base + timedelta(minutes=i)) for i in range(45)]
+        # Collector then writes the 15m candle that opened at 13:30.
+        late = self._kline(base + timedelta(minutes=30), interval="15m")
+        source = FakeSource(table, already + [late])
+        dest = FakeDest(table, existing=list(already))
+
+        assert await sync_table(source, dest, table, batch_size=100) == 0
+        assert late not in dest.rows, "documents the bug: forward-only walk skips it"
+
+    async def test_lag_recovers_the_late_candle(self):
+        table = find_table("klines")
+        base = datetime(2026, 8, 23, 13, 0, tzinfo=timezone.utc)
+        already = [self._kline(base + timedelta(minutes=i)) for i in range(45)]
+        late = self._kline(base + timedelta(minutes=30), interval="15m")
+        source = FakeSource(table, already + [late])
+        dest = FakeDest(table, existing=list(already))
+
+        before = len(dest.rows)
+        transferred = await sync_table(source, dest, table, batch_size=100, lag=timedelta(hours=2))
+        assert late in dest.rows, "the row below the watermark should come back"
+        assert len(dest.rows) == before + 1, "and it should be the only new row"
+        # The return value counts rows *transferred*, overlap included — the
+        # lookback re-reads what the archive already has, by design.
+        assert transferred > 1
+
+    async def test_lag_reread_is_idempotent(self):
+        """The overlap re-reads rows already held; none may be duplicated."""
+        table = find_table("klines")
+        base = datetime(2026, 8, 23, 13, 0, tzinfo=timezone.utc)
+        rows = [self._kline(base + timedelta(minutes=i)) for i in range(45)]
+        source = FakeSource(table, rows)
+        dest = FakeDest(table, existing=list(rows))
+
+        transferred = await sync_table(source, dest, table, batch_size=100, lag=timedelta(hours=2))
+        assert len(dest.rows) == 45, "re-reading must not duplicate anything"
+        assert transferred == 45, "but all 45 were re-read: the count is transfers, not inserts"

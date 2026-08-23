@@ -57,9 +57,48 @@ Notes:
   `manage_retention=False`, so it cannot attach the gs-common default of 90 days
   to this unbounded database — which would otherwise silently drop the history
   it had just written.
+- **It stops short of the archive's newest row, on purpose.** The sync resumes
+  from a single `(open_time, symbol, interval)` watermark and only walks
+  forward, so the archive has to stay a prefix of the collector in that order.
+  Backfill therefore takes a run-wide cap and fills only *below* the watermark;
+  the recent tail is the sync's job. Without it, walking pairs sequentially
+  leaves each one ending at a different "now" and strands every collector row
+  in the resulting staircase. See the invariant note in
+  [gs_archive/sync.py](gs_archive/sync.py).
 - Run it from the Mac, not the Pi: the download is the Mac's bandwidth and the
   Pi only sees the COPY stream. Measured ~3,000 rows/s end to end over the
   tailnet against the USB2 SSD.
+
+### Gaps that are real
+
+Seven windows are missing from 15m and 1h across **every** symbol — 2021-02-11,
+03-06, 04-20, 04-25, 08-13, 09-29 and 2023-03-24, totalling 14 hourly candles.
+These are Binance outages, not backfill failures: the timestamps are identical
+for all ten symbols and both intervals, and the public dumps have no rows there
+either — no trading happened, so no candle exists. 1m/5m (from 2025-09) are
+completely contiguous.
+
+A side effect worth knowing: because those months can never reach their expected
+candle count, the completeness check re-downloads those six dumps on every run.
+They insert 0 rows and the log says so (`0 new candles from dump (N in file)`),
+costing a couple of minutes on a re-run. That is the price of not persisting
+per-month state, and it is preferred to a fuzzy "close enough" threshold that
+would let a genuine gap through.
+
+## Why the sync rewinds before its watermark
+
+`sync_table` resumes from the archive's own max keyset tuple, which quietly
+assumes rows arrive in that order. `klines` breaks the assumption: it holds all
+four intervals in one table, and a 15m candle is written when it **closes** —
+fifteen minutes after its own `open_time`. By then 1m candles have pushed the
+watermark past it, its tuple sorts below the cursor, and a forward-only walk
+never sees it again. Same for 5m and, worst, 1h.
+
+`GS_ARCHIVE_SYNC_LAG_S` (default 2h) restarts each sync that far behind the
+watermark. It must exceed the largest kline interval, so a 1h candle is always
+still inside the window when it lands. The overlap costs nothing — inserts are
+`ON CONFLICT DO NOTHING` — but it does mean the row counts a sync reports
+include re-read rows, so a sync with nothing new no longer says 0.
 
 ## Deploy
 

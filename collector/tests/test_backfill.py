@@ -2,9 +2,12 @@ from datetime import date, datetime, timezone
 
 from gs_common.config import Settings
 
+from gs_common.db import ms_to_dt
+
 from gs_collector.backfill import (
     complete_months,
     expected_rows,
+    last_closed_open_ms,
     month_bounds_ms,
     months_to_fetch,
     normalize_ts_ms,
@@ -98,3 +101,62 @@ def test_backfill_start_for_interval_override():
     assert s.backfill_start_for("1h") == date(2021, 1, 1)   # default
     assert s.backfill_start_for("1m") == date(2025, 9, 1)   # override
     assert s.backfill_start_for("5m") == date(2025, 9, 1)
+
+
+async def test_backfill_eligibility_is_fixed_at_run_start():
+    """The archive's sync resumes from one (open_time, symbol, interval) tuple.
+
+    That is lossless only while the archive is a *prefix* of the collector in
+    that order. Pairs are backfilled sequentially, so an uncapped REST phase
+    ends each pair at a different "now" — a staircase whose global maximum sits
+    above most pairs' own maxima, stranding every collector row in between
+    where the forward-only sync can never reach it. One run-wide cap keeps the
+    maximum flat."""
+    as_of = datetime(2026, 8, 23, 13, 18, tzinfo=timezone.utc)
+    fetched, inserted = [], []
+
+    class FakeConn:
+        async def fetch(self, *a):
+            return []
+
+        async def fetchval(self, *a):
+            return None
+
+    class FakeRest:
+        async def get_json(self, path, params):
+            fetched.append(params)
+            return []  # no rows -> exercises range selection, not parsing
+
+    async def fake_upsert(conn, records):
+        inserted.extend(records)
+        return len(records)
+
+    import gs_collector.backfill as bf
+    real_upsert, bf.upsert_chunks = bf.upsert_chunks, fake_upsert
+    try:
+        settings = Settings(backfill_start=date(2026, 8, 1))
+        # No session use: every month in range is the current one, so REST-only.
+        await bf.backfill_pair(FakeConn(), FakeRest(), None, settings,
+                               "BTCUSDT", "1h", as_of=as_of)
+    finally:
+        bf.upsert_chunks = real_upsert
+
+    assert fetched, "expected a REST range request for the current month"
+    # 12:00 is the newest 1h candle closed at 13:18; 13:00 closes at 14:00.
+    cap_ms = int(datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    for params in fetched:
+        assert params["endTime"] <= cap_ms, f"REST range ran past the cap: {params}"
+    assert all(r[2] <= ms_to_dt(cap_ms) for r in inserted)
+
+
+def test_last_closed_open_ms_is_wall_clock_independent():
+    """Two pairs fetched minutes apart must resolve to the same last candle."""
+    def ms(h, m):
+        return int(datetime(2026, 8, 23, h, m, tzinfo=timezone.utc).timestamp() * 1000)
+    # 13:15 opens before 13:18 but closes at 13:30 -> not eligible at 13:18.
+    assert last_closed_open_ms(ms(13, 18), "15m") == ms(13, 0)
+    # Still 13:00 at 13:29, only 13:15 once its close has passed.
+    assert last_closed_open_ms(ms(13, 29), "15m") == ms(13, 0)
+    assert last_closed_open_ms(ms(13, 30), "15m") == ms(13, 15)
+    assert last_closed_open_ms(ms(13, 18), "1h") == ms(12, 0)
+    assert last_closed_open_ms(ms(13, 18), "1m") == ms(13, 17)

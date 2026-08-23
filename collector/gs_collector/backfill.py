@@ -30,7 +30,6 @@ import calendar
 import csv
 import io
 import logging
-import time
 import zipfile
 from datetime import date, datetime, timezone
 
@@ -100,6 +99,19 @@ def months_to_fetch(
     ]
 
 
+def last_closed_open_ms(as_of_ms: int, interval: str) -> int:
+    """Open time of the newest candle already closed at `as_of_ms`.
+
+    Eligibility must be a function of the run-start instant, never of the wall
+    clock at the moment a given pair happens to be fetched. Otherwise a long run
+    admits a candle for the pairs it reaches after that candle closes and drops
+    it for the ones it reached earlier — the same staircase the cap exists to
+    prevent, just one candle wide.
+    """
+    iv = INTERVAL_MS[interval]
+    return (as_of_ms // iv) * iv - iv
+
+
 def recent_months(months: list[tuple[int, int]], today: date, n: int) -> list[tuple[int, int]]:
     """The subset of `months` falling within the last `n` complete months."""
     y, m = today.year, today.month
@@ -162,20 +174,18 @@ async def month_counts(conn, symbol: str, interval: str) -> dict[tuple[int, int]
 
 
 async def fetch_range_rest(
-    rest: RestClient, symbol: str, interval: str, start_ms: int, end_ms: int
+    rest: RestClient, symbol: str, interval: str, start_ms: int, end_ms: int,
+    as_of_ms: int,
 ) -> list[tuple]:
-    """Closed candles in [start_ms, end_ms) via the REST API, paged at 1000."""
+    """Candles in [start_ms, end_ms) closed as of `as_of_ms`, paged at 1000."""
     interval_ms = INTERVAL_MS[interval]
     cursor, out = start_ms, []
     while cursor < end_ms:
-        now_ms = int(time.time() * 1000)
-        if cursor > now_ms - interval_ms:
-            break
         rows = await rest.get_json("/api/v3/klines", {
             "symbol": symbol, "interval": interval,
             "startTime": cursor, "endTime": end_ms - 1, "limit": 1000,
         })
-        rows = [r for r in rows if int(r[6]) < now_ms]  # closed candles only
+        rows = [r for r in rows if int(r[6]) <= as_of_ms]  # closed as of run start
         if not rows:
             break
         out.extend(
@@ -190,15 +200,36 @@ async def fetch_range_rest(
 
 async def backfill_pair(
     conn, rest: RestClient, session: aiohttp.ClientSession, settings: Settings,
-    symbol: str, interval: str,
+    symbol: str, interval: str, as_of: datetime,
 ) -> int:
+    """Fill history for one pair. `as_of` bounds how *recent* a row may be.
+
+    The archive's sync resumes from a single `(open_time, symbol, interval)`
+    watermark, which is only lossless while the archive is a prefix of the
+    collector in that order — every row below the watermark must already be
+    present. Writing rows *above* the watermark breaks that: anything the
+    collector holds below the new maximum but above what this backfill happened
+    to reach is then unreachable forever, because the sync only walks forward.
+
+    That is easy to do by accident: pairs are walked sequentially, so without a
+    cap each one's REST phase ends at a different "now" and leaves a staircase.
+    `as_of` is the single run-start instant every pair is measured against, so
+    each interval lands on exactly the same last candle regardless of how long
+    the run takes or which pair is reached when."""
     # UTC, not date.today(): open_time and the dump filenames are UTC, so a local
     # date would name the wrong "current month" for hours around each boundary.
     today = datetime.now(timezone.utc).date()
     start = settings.backfill_start_for(interval)
     have = await month_counts(conn, symbol, interval)
     wanted = months_to_fetch(start, today, have, interval)
+    as_of_ms = int(as_of.timestamp() * 1000)
+    cap_ms = last_closed_open_ms(as_of_ms, interval)  # newest open_time we may write
+    cap_dt = ms_to_dt(cap_ms)
+    wanted = [ym for ym in wanted if month_bounds_ms(*ym)[0] <= cap_ms]
     total = 0
+
+    def under_cap(records: list[tuple]) -> list[tuple]:
+        return [r for r in records if r[2] <= cap_dt]
 
     # Phase 1: complete months from the public dumps.
     missing_dumps = []
@@ -213,7 +244,7 @@ async def backfill_pair(
             payload = await resp.read()
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
             raw = zf.read(zf.namelist()[0])
-        records = parse_vision_csv(raw, symbol, interval)
+        records = under_cap(parse_vision_csv(raw, symbol, interval))
         n = await upsert_chunks(conn, records)
         total += n
         log.info("%s %s %04d-%02d: %d new candles from dump (%d in file)",
@@ -231,7 +262,10 @@ async def backfill_pair(
     rest_total = 0
     for y, m in rest_months:
         lo, hi = month_bounds_ms(y, m)
-        records = await fetch_range_rest(rest, symbol, interval, lo, hi)
+        hi = min(hi, cap_ms + 1)
+        if lo >= hi:
+            continue
+        records = await fetch_range_rest(rest, symbol, interval, lo, hi, as_of_ms)
         if records:
             rest_total += await upsert_chunks(conn, records)
     if rest_total:
@@ -256,9 +290,16 @@ async def main() -> None:
     try:
         async with aiohttp.ClientSession() as session, pool.acquire() as conn:
             rest = RestClient(session, settings.spot_rest_base)
+            # One instant for the whole run, so every pair stops on the same
+            # candle and each interval's maximum stays flat — see backfill_pair.
+            as_of = datetime.now(timezone.utc)
+            log.info("as of %s: per-interval caps %s", as_of, {
+                iv: str(ms_to_dt(last_closed_open_ms(int(as_of.timestamp() * 1000), iv)))
+                for iv in settings.kline_intervals})
             for symbol in settings.symbols:
                 for interval in settings.kline_intervals:
-                    n = await backfill_pair(conn, rest, session, settings, symbol, interval)
+                    n = await backfill_pair(conn, rest, session, settings,
+                                            symbol, interval, as_of)
                     grand_total += n
                     log.info("done: %s %s (+%d candles)", symbol, interval, n)
 

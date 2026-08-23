@@ -60,6 +60,54 @@ between phases are the important part, don't skip them.
         unbounded database and dropped the history it had just written
       · `GS_RETENTION_DAYS: "0"` pinned in `archive/docker-compose.yml` so the archive's
         defining property is stated at the deploy site, not inherited
+- [x] **Fixed backfill stranding rows from the archive sync** (2026-08-23) — caused by the
+      first full run above, caught by verifying the *sync watermark* rather than just row
+      counts. The sync resumes from a single `(open_time, symbol, interval)` tuple and only
+      walks forward, so it is lossless only while the archive is a **prefix** of the collector
+      in that order. Backfill walks pairs sequentially; over a 49-minute run each pair's REST
+      phase ended at a different "now", leaving a 44-minute staircase (BTCUSDT 1m ended 12:34,
+      LTCUSDT 1m 13:18). The global maximum jumped to the newest step, so every collector row
+      below it but above its own pair's step became unreachable **forever** — 286 rows, silently.
+      Nothing in the row counts showed it: the totals only grew, and a naive count comparison
+      *hides* it because the archive legitimately holds years the collector does not.
+      Fix: one run-wide cap, read once at start (existing `max(open_time)`, or a single "now"
+      on an empty target), applied to both the dump and REST paths. History is backfill's job;
+      the recent tail is the sync's. The invariant is now stated in `gs_archive/sync.py` so the
+      next writer does not rediscover it the hard way.
+      The first cap attempt was still wrong, and verifying flatness rather than trusting the
+      fix is what caught it: the cap bounded *open* time, but "is this candle closed?" was
+      still evaluated against the wall clock at the moment each pair was fetched. A 15m candle
+      opening 13:15 closes 13:30, so a run spanning 13:30 excluded it for the pairs it reached
+      first and included it for the rest — the same staircase, one candle wide, 2 rows stranded.
+      Eligibility is now a pure function of the run-start instant (`last_closed_open_ms`), so
+      every pair of an interval lands on the same last candle no matter how long the run takes.
+
+- [x] **Fixed the archive sync silently dropping late-arriving rows** (2026-08-23) — a
+      pre-existing bug, not caused by the backfill; found while verifying the backfill's own
+      watermark behaviour, and proved by running a real `sync-once` and watching it *not*
+      recover rows it had skipped. `sync_table` resumed at exactly the destination's max
+      keyset tuple, which assumes rows are *inserted* in keyset order. False for `klines`,
+      which mixes intervals in one table: a 15m candle is written when it **closes**, fifteen
+      minutes after its own `open_time`, by which point 1m candles have pushed the watermark
+      past it. Its tuple sorts below the cursor, so the forward-only walk skipped it for good —
+      roughly one candle per symbol per coarse interval, every sync, forever.
+      Fix: `GS_ARCHIVE_SYNC_LAG_S` (default 2h, must exceed the largest kline interval) rewinds
+      each sync a little behind its watermark. Overlap is free — inserts are already
+      `ON CONFLICT DO NOTHING`. Verified: a lagged `sync-once` recovered all 20 rows the
+      un-lagged one had abandoned.
+      Two consequences worth knowing:
+      · the returned count is rows *transferred*, so it now includes the re-read overlap — a
+        quiet sync no longer reports exactly 0. Exact insert counts would mean staging pages
+        the way `gs backfill` does; `executemany` cannot return one.
+      · **Deployed to the Pi 2026-08-23 14:00** — verified in the running container
+        (`sync_table` carries the `lag` parameter, effective `archive_sync_lag_s=7200.0`),
+        and the sync-on-start moved 11,205 rows.
+- [x] Reconciled archive against collector across all six tables (2026-08-23): five match
+      exactly; `klines` shows the archive as a strict **superset** — zero rows the collector
+      has that the archive lacks, and 457 rows the archive has that the *collector* is missing
+      (websocket-era gaps the backfill repaired from the dumps/REST). No accumulated loss from
+      the sync bug: the archive was only deployed the same day, and the backfill's current-month
+      pass re-covered exactly the window in which losses could have built up.
 
 ### Deployment — collector (VPS)
 - [x] VPS provisioned: Docker + Compose v2.24+
@@ -163,9 +211,16 @@ between phases are the important part, don't skip them.
 - [ ] **Consider a USB3 bridge.** The JM20329 is USB2-only: measured 37.7 MB/s, which is why
       the first full sync takes hours. Fine for a daily delta; an ASM1153E/JMS578 enclosure
       would be a strict upgrade.
-- [ ] **Multi-year kline history loaded into the archive** (2021 → now for 1h/15m,
-      ~1 year for 1m/5m) — the actual phase-1 training set. Verify per-month counts are
-      complete and the series is contiguous, not just that row counts grew.
+- [x] **Multi-year kline history loaded into the archive** (2026-08-23): 8,633,620 candles —
+      1h/15m from 2021-01-01, 1m/5m from 2025-09-01, all 10 symbols. Verified by contiguity
+      per series (not by row counts, which hide exactly this class of fault): every series is
+      gap-free apart from seven windows that are real Binance outages (2021-02-11, 03-06,
+      04-20, 04-25, 08-13, 09-29, 2023-03-24 — identical on every symbol and both intervals,
+      and absent from the public dumps too). All four intervals end on a flat maximum.
+- [x] **Post-redeploy reconciliation (2026-08-23)**: zero rows the collector holds that the
+      archive lacks, across all six tables; archive retention still absent; all intervals flat;
+      no unexpected holes. The archive is a strict superset — it also carries 457 klines the
+      *collector* is missing, live-collection gaps the backfill repaired from the dumps/REST.
 - [ ] Archive survives a missed sync window (stop it a few days, verify catch-up on restart)
 - [ ] Backup story for the SSD decided (even rsync of weekly pg_dump is fine)
 - [ ] Consider retry-with-backoff on a failed sync: `sync_loop` sleeps the full interval after

@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     source_database_url: str = ""
     archive_sync_interval_s: float = 86_400.0  # 1 day
     archive_batch_size: int = 20_000
+    # How far back before its watermark each sync restarts. Must exceed the
+    # largest kline interval: a 1h candle is written a full hour after its
+    # open_time, by which point 1m candles have pushed the watermark past it,
+    # and a forward-only walk would never see it. Overlap is free (ON CONFLICT
+    # DO NOTHING), so the only cost of a larger value is re-reading rows.
+    archive_sync_lag_s: float = 7_200.0  # 2h
 
     @field_validator("symbols", "kline_intervals", mode="before")
     @classmethod
