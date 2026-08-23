@@ -23,7 +23,7 @@ The project is split by deployment target — four modules, four machines:
 | `futures` | collector | Funding rates (with full backfill) + open interest from USDT perps |
 | `monitor` | collector | Heartbeat watchdog + daily data-quality report → Discord |
 | `backfill` | collector | One-shot kline history loader (data.binance.vision dumps + REST top-up) |
-| `sync` | archive | Pulls new rows from the collector into an unbounded local archive (default weekly) |
+| `sync` | archive | Pulls new rows from the collector into an unbounded local archive (default daily) |
 
 ## Why collection and archive are on different machines
 
@@ -31,8 +31,8 @@ The order book collector is the one component where a gap is unrecoverable — c
 can always be re-downloaded, but order book data only exists if you record it live. That makes
 it worth running on whatever connection is actually reliable, which is a cheap VPS, not home
 internet/power. The archive's job is much less time-sensitive: a periodic pull tolerates being
-offline for a while, since the collector's 90-day retention gives roughly 13 weeks of buffer
-to catch up from if a sync is missed.
+offline for a while, since the collector's 90-day retention is the real safety margin — at the
+archive's daily cadence that's ~90 consecutive missed runs before anything is actually lost.
 
 ## Deploy the collector (VPS)
 
@@ -112,7 +112,7 @@ so `gs-collector` resolves from inside the containers on a plain bridge network.
 ```sh
 cd archive
 cp .env.example .env                                 # set GS_SOURCE_DATABASE_URL to gs-collector:5432
-docker --context gs-archive compose up -d --build    # local TimescaleDB (unbounded) + the weekly sync job
+docker --context gs-archive compose up -d --build    # local TimescaleDB (unbounded) + the daily sync job
 ```
 
 `sync` runs one pass immediately on start, then every

@@ -51,20 +51,21 @@ Each box is an independent process/container so the collectors keep running whil
 | Machine | Module | Role | What runs there |
 |---|---|---|---|
 | **VPS** (cheap, reliable connection) | `collector` | **Collection** — live, rolling window | TimescaleDB (`GS_RETENTION_DAYS=90`) + all collectors + monitor, 24/7. Later shares this box with `execution`. |
-| **Raspberry Pi 4** (500GB SATA SSD, at home) | `archive` | **Archive** — permanent record | TimescaleDB (unbounded) + a sync job that pulls new rows from the collector VPS on a fixed interval (default weekly) |
+| **Raspberry Pi 4** (SATA SSD over USB3, at home) | `archive` | **Archive** — permanent record | TimescaleDB (unbounded) + a sync job that pulls new rows from the collector VPS on a fixed interval (default daily) |
 | **Mac** | `training` | **Training** — research | Feature pipeline, labeling, LightGBM training, backtesting; MLflow for experiments/model registry |
 | **VPS** (same box as `collector`) | `execution` | **Execution** — live | Reads the collector's own DB directly (no separate stack); inference, signal engine, notifier; phase 3 adds the order executor + risk manager |
 
 Why collection moved off the Pi: the order book collector is the one component where a gap
 is unrecoverable, so it belongs on whichever connection is actually reliable — a VPS, not
 home internet/power. The Pi's job becomes much less time-sensitive: a periodic batch pull
-tolerates the Pi being offline for a while, since the collector's 90-day window gives roughly
-13 weeks of buffer to catch up from if a sync is missed.
+tolerates the Pi being offline for a while, since the collector's 90-day window is the real
+safety margin — at the archive's daily cadence that's ~90 consecutive missed runs before
+anything is actually lost.
 
 Data flows:
 
 - **collector → archive:** the Pi's `archive` service pulls new rows from the collector VPS
-  at a fixed interval (default 7 days) over a private network (Tailscale/WireGuard — never
+  at a fixed interval (default 1 day) over a private network (Tailscale/WireGuard — never
   expose the collector's Postgres publicly). Sync is keyset-paginated and idempotent, so
   missed or partial runs just catch up next time; nothing is ever lost as long as a sync
   happens within the 90-day window.

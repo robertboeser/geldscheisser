@@ -1,5 +1,5 @@
 """Archive sync: pull new rows from the collector into the local, unbounded
-archive on a fixed interval (default weekly).
+archive on a fixed interval (default daily).
 
 Each table is paginated by its full primary key, reordered time-column-first
 (`keyset_cols`) — the destination's own current max row *is* the resume
@@ -9,8 +9,9 @@ the archive is a straight copy of history, never a live merge, so unlike the
 collector's own upserts it must never need to overwrite a row it already has.
 
 The collector's retention window (e.g. 90 days) only needs to outlive the
-sync interval by a comfortable margin — a missed week or two of syncing does
-not lose data, it just delays archiving it.
+sync interval by a comfortable margin — at a daily cadence that is ~90
+consecutive missed runs of slack. A missed run does not lose data, it just
+delays archiving it.
 """
 
 import asyncio
@@ -148,7 +149,7 @@ def _redact(dsn: str) -> str:
 
 
 async def main() -> None:
-    """Long-running service: sync on a fixed interval (default weekly)."""
+    """Long-running service: sync on a fixed interval (default daily)."""
     settings = load_settings()
     setup_logging(settings.log_level)
     if not settings.source_database_url:

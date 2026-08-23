@@ -1,5 +1,5 @@
 # Archive stack (Raspberry Pi). Pulls new rows from the collector VPS at a
-# configurable interval (default weekly) into a local, unbounded-retention
+# configurable interval (default daily) into a local, unbounded-retention
 # TimescaleDB — this is the permanent research archive; training reads from
 # here, never from the live collector directly.
 #
@@ -36,7 +36,12 @@ services:
     volumes:
       - archivedata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gs -d geldscheisser"]
+      # -h 127.0.0.1 forces the check over TCP, and that matters: during first-boot
+      # initdb the entrypoint runs a temporary server with listen_addresses='', so a
+      # default (unix-socket) pg_isready reports healthy while the real server is
+      # still coming up. `archive` then starts, fails to connect, and dies —
+      # self-healing via restart, but it dirties the logs on every fresh volume.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U gs -d geldscheisser"]
       interval: 5s
       timeout: 3s
       retries: 20

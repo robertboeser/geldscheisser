@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # Archive (Pi): pulls new rows from the collector at source_database_url
     # into this machine's own (unbounded) database on a fixed interval.
     source_database_url: str = ""
-    archive_sync_interval_s: float = 604_800.0  # 7 days — "every week or so"
+    archive_sync_interval_s: float = 86_400.0  # 1 day
     archive_batch_size: int = 20_000
 
     @field_validator("symbols", "kline_intervals", mode="before")

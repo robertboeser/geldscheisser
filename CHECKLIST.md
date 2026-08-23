@@ -58,47 +58,72 @@ between phases are the important part, don't skip them.
 - [ ] Coverage ≥99% sustained for one full week (post quality-report fix)
 - [ ] Collectors auto-recover after VPS reboot (`restart: unless-stopped` verified)
 
-### Deployment — archive (Raspberry Pi 4 4GB, 1TB SATA SSD) — deployed 2026-08-23
+### Deployment — archive (Raspberry Pi 4 4GB, SanDisk Ultra II 500GB SSD) — redeployed 2026-08-23
+
+> **Incident, resolved by hardware replacement.** The first attempt on this node ran on a
+> counterfeit fake-capacity USB stick reporting 1TB (Chipsbank CBM2199 controller,
+> placeholder `VendorCo`/`ProductCode` strings, a suspiciously round 2,048,000,000 sectors).
+> It silently discarded writes past its real size; the page cache hid that for hours, then
+> the first reboot produced 61 EFSCORRUPTED errors, `ext4_validate_block_bitmap` failures at
+> a regular 128-block-group stride, Postgres `PANIC: replication checkpoint has wrong magic
+> 4294967295`, and `exec format error` on a binary that had been running fine. The tell in
+> hindsight: the first sync took ~2h57m to move ~1GB. Nothing irreplaceable was lost — the
+> archive is fully reconstructible from the collector. **Lesson kept as the acceptance test
+> below.**
+
 - [x] Pi provisioned: Debian 13 (trixie) arm64, Docker CE 29.7.2 + Compose v5.5.0 from
-      Docker's official apt repo (`trixie stable`), SSD is the boot/root device
-- [x] Docker data root on the SSD — automatic: the Pi boots from the SSD, so
-      `/var/lib/docker` is on `/dev/sda2` (961G, 905G free after the first sync). No SD card involved.
-- [x] Pi and collector VPS joined on the same tailnet. Tailscale runs on the Pi *host*
-      (not a sidecar as on the VPS) — the archive only dials out, so it needs no netns of
-      its own. Docker's embedded resolver forwards to the host's MagicDNS, so `gs-collector`
-      resolves from inside the containers on a plain bridge network — verified.
+      Docker's official apt repo (`trixie stable`)
+- [x] **Storage vetted before use** — the check that the counterfeit drive would have failed:
+      (a) real SMART passthrough `smartctl -d sat -a` → `SanDisk Ultra II 500GB`, serial
+      present, **PASSED**, 0 reallocated sectors, 0 program/erase failures, 0 CRC errors
+      (21,706 power-on hours — used, but no wear indicators); (b) sector count 976,773,168 =
+      500,107,862,016 bytes, the drive's true size, not a round number; (c) durability test —
+      5GB written with direct I/O (exceeds the 3.7GB of RAM), caches dropped, re-read twice:
+      identical checksums both times. Bridge is a real `JMicron JM20329 SATA Bridge`.
+- [x] Docker data root on the SSD — automatic: the Pi boots from it, so `/var/lib/docker` is
+      on `/dev/sda2` (459G, 433G free)
+- [x] Pi and collector VPS on the same tailnet (new node → new IP `100.94.83.38`). Tailscale
+      runs on the Pi *host*, not a sidecar — the archive only dials out. Docker's embedded
+      resolver forwards to the host MagicDNS, so a container resolves `gs-collector` on a plain
+      bridge network and reaches its Postgres — both verified before deploying.
+- [x] Stale SSH host keys for the reinstalled box replaced (key read from the box itself, not
+      keyscanned), so the `gs-archive` Docker context connects over the tailnet name
 - [x] `GS_SOURCE_DATABASE_URL=postgresql://gs:gs@gs-collector:5432/geldscheisser` (tailnet name,
       not a public IP)
 - [x] `docker --context gs-archive compose up -d --build` — both services up, timescaledb healthy
-- [x] First sync completed (2026-08-23 01:59): 2,315,704 rows in ~2h57m —
-      klines=359,793 · book_rollups=1,533,183 · book_snapshots=51,560 ·
-      agg_trades_1m=257,533 · funding_rates=61,885 · open_interest=51,750.
-      Peak memory stayed ≥3.0GB available; disk grew ~5GB.
-- [x] Postgres reachable from the Mac over the tailnet
-      (`psql postgresql://gs:gs@gs-archive:5433/geldscheisser`) — real query verified, not just a TCP accept
-- [x] **Not** reachable on the LAN: the container port is bound to `127.0.0.1` and fronted by
-      `tailscale serve --bg --tcp=5433 tcp://localhost:5433`; connecting to the Pi's LAN IP:5433
-      is refused. Same posture as the collector.
-- [x] Confirmed idempotent: back-to-back `sync-once` runs added 27,278 then **110** rows —
-      the second run picked up only what the live collector produced in between, so the
-      keyset watermark resumes rather than re-copying.
-- [x] Unbounded retention confirmed: `timescaledb_information.jobs` shows compression at
-      14 days on all 4 hypertables and **no** `drop_after` policy on any of them
-- [x] Auto-recovery verified: `systemctl restart docker` → both containers back up
-      (`restart: unless-stopped`), and the archive container still resolves `gs-collector`
-- [x] Boot-order race closed: added a `docker.service` drop-in with
-      `After=/Wants=tailscaled.service`. Without it Docker can start before tailscaled writes
-      `/etc/resolv.conf`, containers capture a pre-Tailscale resolver, and the failed sync then
-      sleeps a full `GS_ARCHIVE_SYNC_INTERVAL_S` (7 days) before retrying.
-- [ ] Full reboot test still pending — the Pi is also a desktop (lightdm/wayvnc/cups) with
-      users logged in, so this wants a convenient moment. The drop-in above is the fix being tested.
+- [x] `tailscale serve --bg --tcp=5433 tcp://localhost:5433` re-applied on the new node
+      (serve config lives in tailscaled state, so a rebuild loses it)
+- [x] Boot-order race closed again: `docker.service` drop-in with `After=/Wants=tailscaled.service`
+- [x] **Healthcheck race fixed** (`archive/docker-compose.yml`): `pg_isready` now runs with
+      `-h 127.0.0.1`. On a fresh volume the postgres entrypoint runs initdb against a temp
+      server with `listen_addresses=''`, so the default unix-socket check reported healthy
+      while the real server was still starting — `archive` then started, failed to connect and
+      died. Self-healing via `restart:`, but it dirtied the logs on every fresh volume; seen
+      on both deployments before being fixed.
+- [x] **Persistent journal enabled.** Raspberry Pi OS ships
+      `40-rpi-volatile-storage.conf` (RAM-only journal, to spare SD cards), which meant a
+      connectivity drop-out during this deploy left no evidence at all. Overridden with a
+      `99-persistent.conf` drop-in — it must sort *after* the rpi one to win — capped at 200M.
+- [ ] First full sync completed on the vetted SSD; row counts match the collector
+- [ ] Confirmed idempotent: a second `sync-once` adds only newly-collected rows
+- [ ] Unbounded retention confirmed (compression policies present, no `drop_after`)
+- [ ] Postgres reachable from the Mac over the tailnet, and **not** on the LAN
+- [ ] Reboot test — the check that caught the counterfeit drive. Re-run on this hardware;
+      also the first real test of the MagicDNS-after-boot behaviour the drop-in guards against.
+- [ ] **Move the node to Ethernet.** It is on `wlan0` (`eth0` down). A Wi-Fi flap during this
+      deploy dropped the tailnet and the LAN simultaneously for ~a minute mid-sync (the box
+      itself stayed up; the sync resumed idempotently). Wi-Fi is a poor fit for a node whose
+      job is pulling GBs.
+- [ ] **Consider a USB3 bridge.** The JM20329 is USB2-only: measured 37.7 MB/s, which is why
+      the first full sync takes hours. Fine for a daily delta; an ASM1153E/JMS578 enclosure
+      would be a strict upgrade.
 - [ ] Archive survives a missed sync window (stop it a few days, verify catch-up on restart)
 - [ ] Backup story for the SSD decided (even rsync of weekly pg_dump is fine)
-- [ ] Consider retry-with-backoff on a failed sync: `sync_loop` currently sleeps the full
-      interval after *any* failure, so one transient error costs a week of freshness. The
-      90-day collector retention means it isn't data loss, and the Discord alert fires — but
-      it needs a human. A few short retries before falling back to the weekly cadence would
-      make it self-healing.
+- [ ] Consider retry-with-backoff on a failed sync: `sync_loop` sleeps the full interval after
+      *any* failure, so one transient error costs a day of freshness (and Wi-Fi flaps make
+      transient errors likelier here). The 90-day collector retention means it is not data
+      loss, and the Discord alert fires. A few short retries before falling back to the daily
+      cadence would make it self-healing.
 
 **Gate → phase 1:** klines backfilled (research can start now) · ≥4–8 weeks
 of continuous order book rollups in the archive before book features join the model.

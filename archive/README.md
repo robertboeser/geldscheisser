@@ -1,6 +1,6 @@
 # gs-archive — permanent record (runs on the Raspberry Pi)
 
-Pulls new rows from the collector VPS at a fixed interval (default weekly)
+Pulls new rows from the collector VPS at a fixed interval (default daily)
 into a local, unbounded-retention TimescaleDB. This is the archive of record
 that [training/](../training/) reads from — the collector itself only ever
 holds a 90-day rolling window.
@@ -10,7 +10,8 @@ connection (an order book gap is unrecoverable), which home internet isn't
 always great at — so it runs on a VPS instead. The archive's job is much less
 time-sensitive: it just needs to catch up eventually, so a Pi behind a home
 connection (or power cycle) is a fine place for it. The collector's 90-day
-retention gives roughly 13 weeks of buffer if a sync is missed.
+retention is the real safety margin: at a daily cadence that's ~90
+consecutive missed runs before anything is actually lost.
 
 ## How syncing works
 
@@ -24,9 +25,31 @@ just picks up where the local data already ends. Inserts use
 ## Deploy
 
 **As built:** Raspberry Pi 4 Model B (4GB), Debian 13 (trixie) arm64, booting
-from a 1TB SATA SSD — root *is* the SSD, so Docker's data root
-(`/var/lib/docker`) lands there with nothing to configure and the SD card
-isn't in the picture at all. Host name on the tailnet: `gs-archive`.
+from a **SanDisk Ultra II 500GB SATA SSD** behind a JMicron JM20329 USB–SATA
+bridge, on its own power supply. Root *is* the SSD, so Docker's data root
+(`/var/lib/docker`) lands there with nothing to configure and no SD card is
+involved. Tailnet name `gs-archive` (`100.94.83.38`); also reachable on the
+LAN as `gs-archive.local`.
+
+Three things worth knowing about this box:
+
+- **The SSD was vetted before use.** A previous drive here was a counterfeit
+  fake-capacity USB stick that reported 1TB, silently discarded writes beyond
+  its real size, and destroyed the archive on the first reboot — the page cache
+  hid the problem for hours. So the acceptance check is now: real SMART
+  passthrough (`smartctl -d sat -a`) showing a plausible model/serial and 0
+  reallocated sectors, a sector count matching the real product, and a
+  write-past-RAM/drop-caches/re-read byte comparison. This drive passes all
+  three (500,107,862,016 bytes, SMART PASSED, 0 reallocated, identical
+  checksums across two cache-dropped reads).
+- **The link is USB 2.0, not USB 3.** The JM20329 is a USB2-only bridge, so
+  throughput measures ~37.7 MB/s regardless of which port it uses. That is
+  fine for a daily delta (tens of MB) but makes the *first* full sync take
+  hours. A USB3 bridge (ASM1153E / JMS578) would be a strict upgrade.
+- **The node is on Wi-Fi** (`wlan0`; `eth0` is down). A Wi-Fi flap during this
+  deploy took out the tailnet and the LAN simultaneously for ~a minute. The
+  sync is idempotent so it just resumes, but Ethernet would remove a whole
+  class of transient failure.
 
 Requires this Pi to be a peer on the same tailnet as the collector VPS. The
 collector side runs Tailscale as a sidecar container that serves its Postgres
@@ -91,7 +114,7 @@ it to its embedded resolver. If Docker starts before `tailscaled` has written
 that file, the containers get a pre-Tailscale resolver and can't resolve
 `gs-collector` at all — and because `sync_loop` sleeps the full
 `GS_ARCHIVE_SYNC_INTERVAL_S` after a failed run, a boot-order race costs a
-week of freshness rather than a retry. `docker.service` ships with only
+whole day of freshness rather than a retry. `docker.service` ships with only
 `After=network-online.target`, so this is closed explicitly:
 
 ```sh
@@ -102,6 +125,25 @@ After=tailscaled.service
 Wants=tailscaled.service
 EOF
 sudo systemctl daemon-reload
+```
+
+### Persistent logs
+
+Raspberry Pi OS ships `/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`
+to keep the journal in RAM and spare the SD card. This box boots from an SSD, and
+a memory-only journal meant an unexplained drop-out during deployment left no
+evidence behind at all. Overridden with a drop-in that must sort *after* the
+rpi one:
+
+```sh
+sudo tee /etc/systemd/journald.conf.d/99-persistent.conf <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=200M
+SystemMaxFileSize=20M
+EOF
+sudo mkdir -p /var/log/journal
+sudo systemctl restart systemd-journald && sudo journalctl --flush
 ```
 
 ### Batch size on a 4GB Pi
