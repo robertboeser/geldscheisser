@@ -1,0 +1,60 @@
+# Archive stack (Raspberry Pi). Pulls new rows from the collector VPS at a
+# configurable interval (default weekly) into a local, unbounded-retention
+# TimescaleDB — this is the permanent research archive; training reads from
+# here, never from the live collector directly.
+#
+# Networking: unlike the collector, the Pi runs Tailscale on the *host*, not
+# as a sidecar container — the archive only needs to dial *out* to the
+# collector, so it has no reason to own a netns. Docker's embedded resolver
+# forwards to the host's Tailscale DNS (100.100.100.100), so plain bridge
+# networking resolves `gs-collector` via MagicDNS from inside these
+# containers with no extra_hosts/dns overrides. Verified on gs-archive
+# 2026-08-22.
+#
+# From this directory (or from the Mac via `docker --context gs-archive`):
+#   cp .env.example .env   # set GS_SOURCE_DATABASE_URL
+#   docker compose up -d --build
+#   docker compose run --rm archive sync-once   # optional: trigger a sync now
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gs
+      POSTGRES_PASSWORD: gs
+      POSTGRES_DB: geldscheisser
+    ports:
+      # Loopback only — never the LAN. The training Mac reads the archive over
+      # the tailnet instead, via a one-time `tailscale serve` on the Pi host:
+      #   tailscale serve --bg --tcp=5433 tcp://localhost:5433
+      # Same mechanism the collector uses for its own Postgres (TAILSCALE.md);
+      # binding here rather than to the Pi's 100.x address keeps the deploy
+      # independent of that address and free of boot-ordering races (tailscale0
+      # may not exist yet when Docker starts containers after a reboot).
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - archivedata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gs -d geldscheisser"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  archive:
+    build:
+      context: ..
+      dockerfile: archive/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      GS_DATABASE_URL: postgresql://gs:gs@timescaledb:5432/geldscheisser
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    command: sync
+
+volumes:
+  archivedata:

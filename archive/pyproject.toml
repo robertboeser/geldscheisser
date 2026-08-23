@@ -1,0 +1,28 @@
+[project]
+name = "gs-archive"
+version = "0.1.0"
+description = "Geldscheißer archive — pulls the collector's data into an unbounded local copy on a fixed interval"
+requires-python = ">=3.11"
+dependencies = [
+    "gs-common",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+gs-archive = "gs_archive.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gs_archive"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

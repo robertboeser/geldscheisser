@@ -43,9 +43,10 @@ logging into the VPS for routine deploys.
 
 ```sh
 git clone <this-repo> && cd geldscheisser/collector
-cp .env.example .env               # set GS_DISCORD_WEBHOOK_URL for alerts
+cp .env.example .env               # set GS_DISCORD_WEBHOOK_URL and TS_AUTHKEY
 docker compose up -d --build       # TimescaleDB (90-day window) + all collectors, 24/7
 docker compose run --rm backfill   # kline history (resumable, re-run any time)
+docker compose exec tailscale tailscale serve --bg --tcp=5432 tcp://localhost:5432   # once
 ```
 
 Check on it:
@@ -59,11 +60,14 @@ docker compose run --rm klines quality    # ad-hoc data-quality report
 > but order book data only exists if you record it live. Gaps are unrecoverable.
 > The monitor alerts on stale collectors — take those alerts seriously.
 
-> **Postgres's port is loopback-only by default.** `GS_BIND_ADDR` (in `.env`,
-> defaults to `127.0.0.1`) controls what the exposed `5433` binds to on the
-> VPS. It's not reachable from anywhere else until you deliberately set it —
-> e.g. to this VPS's Tailscale/WireGuard IP once the archive needs to pull
-> from here. Never set it to `0.0.0.0` or a public IP.
+> **No port is published on the host at all — not even loopback.** Every
+> service shares a `tailscale` sidecar container's network namespace
+> (see [collector/TAILSCALE.md](collector/TAILSCALE.md)); Postgres is reachable
+> only at `gs-collector:5432` over the tailnet, once `tailscale serve` (above)
+> has run. The only thing ever reachable from outside this host is SSH.
+> For ad-hoc commands, use `docker compose exec <any-service> gs quality`
+> rather than running `gs` directly on the bare host — there's nothing there
+> to connect to anymore.
 
 ### Deploy from the Mac via SSH (recommended)
 
@@ -97,18 +101,33 @@ the server directly.
 
 ## Deploy the archive (Raspberry Pi)
 
-Put the VPS and the Pi on the same private network (Tailscale or WireGuard) first —
-the archive should never reach the collector's Postgres over the open internet.
+The collector VPS already serves its Postgres over the tailnet via a
+Tailscale sidecar container (see [collector/TAILSCALE.md](collector/TAILSCALE.md))
+— no port published on the VPS host at all. The Pi (`gs-archive`) is a peer on
+that same tailnet, running Tailscale on the **host** rather than as a sidecar:
+the archive only dials *out* to the collector, so it has no reason to own a
+network namespace. Docker's embedded resolver forwards to the host's MagicDNS,
+so `gs-collector` resolves from inside the containers on a plain bridge network.
 
 ```sh
 cd archive
-cp .env.example .env               # set GS_SOURCE_DATABASE_URL to the collector's private address
-docker compose up -d --build       # local TimescaleDB (unbounded) + the weekly sync job
-docker compose run --rm archive sync-once   # optional: trigger a sync immediately
+cp .env.example .env                                 # set GS_SOURCE_DATABASE_URL to gs-collector:5432
+docker --context gs-archive compose up -d --build    # local TimescaleDB (unbounded) + the weekly sync job
 ```
 
-Docker's data root (or at least the `archivedata` volume) should live on the Pi's SSD,
-not the SD card — see [archive/README.md](archive/README.md) for details.
+`sync` runs one pass immediately on start, then every
+`GS_ARCHIVE_SYNC_INTERVAL_S` — the first sync begins on `up`, nothing to
+trigger. Then once, on the Pi, to let the training Mac read the archive over
+the tailnet (the container's port is bound to `127.0.0.1`, never the LAN):
+
+```sh
+sudo tailscale serve --bg --tcp=5433 tcp://localhost:5433
+```
+
+The Pi boots from its SSD, so Docker's data root is already on the SSD with
+nothing to configure — the SD card isn't in the picture. See
+[archive/README.md](archive/README.md) for the full as-built notes, including
+why `GS_ARCHIVE_BATCH_SIZE` is lowered on a 4GB Pi.
 
 ## Local development (Mac)
 
@@ -123,5 +142,6 @@ Configuration is env-driven (prefix `GS_`, optional `.env`) — see
 [collector/.env.example](collector/.env.example), [archive/.env.example](archive/.env.example),
 and [common/gs_common/config.py](common/gs_common/config.py) for all knobs.
 
-Training (phase 1) reads the Pi's archive over the LAN and tracks experiments
+Training (phase 1) reads the Pi's archive over the tailnet
+(`postgresql://gs:gs@gs-archive:5433/geldscheisser`) and tracks experiments
 in MLflow: `cd training && docker compose up -d` → http://localhost:5001.
