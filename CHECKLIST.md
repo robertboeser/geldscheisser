@@ -104,16 +104,40 @@ between phases are the important part, don't skip them.
       `40-rpi-volatile-storage.conf` (RAM-only journal, to spare SD cards), which meant a
       connectivity drop-out during this deploy left no evidence at all. Overridden with a
       `99-persistent.conf` drop-in — it must sort *after* the rpi one to win — capped at 200M.
-- [ ] First full sync completed on the vetted SSD; row counts match the collector
-- [ ] Confirmed idempotent: a second `sync-once` adds only newly-collected rows
-- [ ] Unbounded retention confirmed (compression policies present, no `drop_after`)
-- [ ] Postgres reachable from the Mac over the tailnet, and **not** on the LAN
-- [ ] Reboot test — the check that caught the counterfeit drive. Re-run on this hardware;
-      also the first real test of the MagicDNS-after-boot behaviour the drop-in guards against.
-- [ ] **Move the node to Ethernet.** It is on `wlan0` (`eth0` down). A Wi-Fi flap during this
-      deploy dropped the tailnet and the LAN simultaneously for ~a minute mid-sync (the box
-      itself stayed up; the sync resumed idempotently). Wi-Fi is a poor fit for a node whose
-      job is pulling GBs.
+- [x] First full sync completed on the vetted SSD (2026-08-23 11:57:32 UTC): 2,186,235 rows in
+      this run, ~1h13m. Row counts match the collector —
+      klines=370,563 · book_rollups=1,570,523 · book_snapshots=52,770 · agg_trades_1m=263,533 ·
+      funding_rates=61,895 · open_interest=52,951. Memory held ≥3.19GB available throughout;
+      disk grew to 8.4G of 459G. Measured rate: ~850 rows/s on narrow tables, but only
+      ~32 rows/s on book_snapshots (22KB JSONB rows over a 37.7 MB/s USB2 link) — that one
+      table is most of the wall-clock.
+- [x] Confirmed idempotent: back-to-back `sync-once` runs added 3,751 rows then **exactly 0**.
+      The keyset watermark resumes rather than re-copying.
+- [x] Unbounded retention confirmed: compression at 14 days on all 4 hypertables and **no**
+      `drop_after` policy on any of them.
+- [x] Postgres reachable from the Mac over the tailnet
+      (`psql postgresql://gs:gs@gs-archive:5433/geldscheisser` — real query, not just a TCP
+      accept), and **refused** on the Pi's LAN address. Verified again after the reboot.
+- [x] **Reboot test PASSED** (2026-08-23 14:00) — the check that caught the counterfeit drive:
+      filesystem `clean` with no error count and no I/O errors in dmesg (vs 61 EFSCORRUPTED
+      before); Postgres recovered cleanly to "ready to accept connections" with no PANIC; both
+      containers back up via `restart: unless-stopped`; every row count ≥ the pre-reboot
+      baseline, so nothing was lost. The ordering drop-in did its job — tailscaled 14:00:42,
+      docker 14:00:52 — and **MagicDNS resolution from inside the container after boot is now
+      verified for the first time** (`gs-collector` → 100.72.199.65), which is precisely what
+      the drop-in exists to guarantee. `tailscale serve` survived (it lives in tailscaled
+      state), and the sync-on-start caught up the 156-row delta 3s after the DB was ready.
+      The persistent journal also retained the pre-reboot boot, so it works.
+- [ ] **Ethernet not yet working.** A cable was attached 2026-08-23 but the link carries no
+      traffic: carrier up and 100Mb/s negotiated, yet `rx_packets=0` against 66 DHCP DISCOVERs
+      sent, NetworkManager cycling on `ip-config-unavailable`, and eth0 now DOWN. Zero inbound
+      frames (not even broadcasts) plus 100Mb/s on a gigabit-capable Pi 4 points at a bad cable
+      (only 2 of 4 pairs usable) or a dead switch port. Still on `wlan0`, where a Wi-Fi flap
+      already dropped the tailnet and LAN together for ~a minute mid-sync. Retest with:
+      `cat /sys/class/net/eth0/statistics/rx_packets` (must go non-zero),
+      `ip -brief addr show eth0` (needs a v4 address), `ethtool eth0 | grep Speed` (want 1000Mb/s).
+      Once it gets a lease NetworkManager prefers it automatically (metric 100 vs 600) — no config
+      needed, and Wi-Fi stays as failover.
 - [ ] **Consider a USB3 bridge.** The JM20329 is USB2-only: measured 37.7 MB/s, which is why
       the first full sync takes hours. Fine for a daily delta; an ASM1153E/JMS578 enclosure
       would be a strict upgrade.

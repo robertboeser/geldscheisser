@@ -46,10 +46,14 @@ Three things worth knowing about this box:
   throughput measures ~37.7 MB/s regardless of which port it uses. That is
   fine for a daily delta (tens of MB) but makes the *first* full sync take
   hours. A USB3 bridge (ASM1153E / JMS578) would be a strict upgrade.
-- **The node is on Wi-Fi** (`wlan0`; `eth0` is down). A Wi-Fi flap during this
-  deploy took out the tailnet and the LAN simultaneously for ~a minute. The
-  sync is idempotent so it just resumes, but Ethernet would remove a whole
-  class of transient failure.
+- **The node is on Wi-Fi** (`wlan0`). An Ethernet cable was attached but that
+  link carries no traffic — carrier up at 100Mb/s, yet `rx_packets=0` against
+  66 DHCP DISCOVERs, so eth0 never got a lease. Zero inbound frames plus
+  100Mb/s on a gigabit-capable Pi 4 suggests a bad cable or dead switch port.
+  A Wi-Fi flap during this deploy took out the tailnet and the LAN together for
+  ~a minute mid-sync; the sync is idempotent so it just resumed, but Ethernet
+  would remove a whole class of transient failure. Once eth0 gets a lease
+  NetworkManager prefers it automatically (route metric 100 vs Wi-Fi's 600).
 
 Requires this Pi to be a peer on the same tailnet as the collector VPS. The
 collector side runs Tailscale as a sidecar container that serves its Postgres
