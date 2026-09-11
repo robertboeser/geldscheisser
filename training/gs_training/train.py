@@ -34,8 +34,15 @@ import numpy as np
 
 from .backtest import CostModel, Portfolio, Signal, run_backtest
 from .baselines import random_entries
-from .datasets import DEFAULT_CACHE, load_panel
-from .features import FEATURE_NAMES, MAX_LOOKBACK, compute_features, feature_matrix, usable_mask
+from .datasets import DEFAULT_CACHE, align_funding, load_panel
+from .features import (
+    FEATURE_NAMES,
+    MAX_LOOKBACK,
+    compute_features,
+    cross_sectional,
+    feature_matrix,
+    usable_mask,
+)
 from .labels import WIN, BarrierSpec, cusum_events, ewm_volatility, label_events
 from .metrics import performance
 from .splits import assert_no_leakage, average_uniqueness, walk_forward
@@ -72,6 +79,12 @@ def build_dataset(
     """Build the training matrix. Returns `(dataset, bar_times, panel, sigma)`."""
     bar_times, panel = load_panel(symbols, interval, cache_dir)
     btc = panel.get("BTCUSDT", {}).get("close")
+    # Both need the whole panel, so they are computed once rather than per symbol.
+    cross = cross_sectional(panel)
+    funding = align_funding(bar_times, symbols, cache_dir)
+    if funding is None:
+        log.warning("no funding snapshot in %s — funding features will be NaN; "
+                    "run `python -m gs_training.datasets` to fetch it", cache_dir)
 
     Xs, ys, evs, ends, ws, syms, ups, dns = [], [], [], [], [], [], [], []
     sigma: dict[str, np.ndarray] = {}
@@ -82,7 +95,13 @@ def build_dataset(
 
         feats = compute_features(
             b["open"], b["high"], b["low"], b["close"], b["volume"],
-            quote_volume=b.get("volume"), bar_times=bar_times, btc_close=btc,
+            # Not b["volume"]: passing base volume here made quote_vol_z_168 a
+            # bit-identical copy of vol_z_168 rather than a dollar-volume feature.
+            quote_volume=b["quote_volume"],
+            taker_buy_volume=b["taker_buy_volume"],
+            bar_times=bar_times, btc_close=btc,
+            funding=None if funding is None else funding.get(sym),
+            cross=cross.get(sym),
         )
         X_all = feature_matrix(feats)
         finite = usable_mask(X_all, min_bar=MAX_LOOKBACK)

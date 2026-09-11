@@ -284,16 +284,58 @@ continuous order book rollups in the archive before book features join the model
       plus `load_panel` for an inner-joined multi-symbol bar grid. Read-only by
       construction: connects with raw asyncpg rather than `gs_common.create_pool`,
       which would apply schema DDL to the archive of record.
-- [x] Feature library (`features.py`) — 41 causal features: multi-timeframe returns,
+- [x] Feature library (`features.py`) — 46 declared, 45 live: multi-timeframe returns,
       EMA distances, RSI/MACD/Bollinger, ATR and realized vol, candle shape, breakout
-      distance, volume/flow z-scores, cyclical calendar, BTC regime + rolling beta.
+      distance, volume/flow z-scores, cyclical calendar, BTC regime + rolling beta,
+      funding, and a cross-sectional block. `oi_change_24` is the one deliberate NaN.
       Two properties are asserted by tests rather than assumed, because a violation of
       either produces a model that backtests well and loses money live: **causality**
       (mutating the tail of a series must not change any earlier value) and
       **prefix-stability** (computing on `close[:k]` matches the full-series result for
       the first `k` rows — which is exactly what live inference does).
-- [ ] Order book features from rollups (spread/imbalance/depth trends) — gated on the
-      4–8 week rollup accumulation, not on code
+- [x] **Fixed the model being fed a third less than it had** (2026-09-11), found by
+      counting what actually reaches the matrix rather than what `FEATURE_NAMES`
+      declares. Of 41 declared features, **5 were permanently NaN and 1 was an exact
+      duplicate** — 35 distinct, not 41. Neither failure raises anything: an all-NaN
+      column is dropped as an absent optional input, which is indistinguishable from a
+      feature that was never wanted.
+      · `load_panel` built the panel from `("open","high","low","close","volume")` while
+        `KLINE_COLUMNS` had been selecting `quote_volume`, `trades`, `taker_buy_volume`
+        and `taker_buy_quote_volume` all along — the columns were in the Parquet files on
+        disk, back to 2021, and were discarded on the last hop. The panel now carries
+        `PANEL_COLUMNS`.
+      · Because the panel had no quote volume, `train.py` passed `quote_volume=b["volume"]`,
+        so `quote_vol_z_168` was bit-identical to `vol_z_168` across all 49,440 rows.
+      · `taker_buy_volume` was the expensive loss: aggressor-side flow is the only
+        order-flow measurement in this dataset with history to 2021, and the order book —
+        the obvious substitute — can never be backfilled at all.
+      · `test_features.py` did not catch any of it, and could not have: its `synth()`
+        fixture supplies every optional input, so the library was always tested with data
+        the pipeline never delivered. The new `test_datasets.py` asserts the loader
+        contract instead of the library contract.
+- [x] Funding wired through to the model (2026-09-11): `snapshot_funding` +
+      `align_funding` in `datasets.py`. 62,445 rows, 8-hourly, **2021-01-01 onward for all
+      10 symbols** — the same span as the klines, so unlike the order book it needed no
+      waiting. Alignment is a causal step function: each bar takes the last rate published
+      at or *before* its own `open_time`. Reaching forward for the next print would be a
+      lookahead of up to 8h that reads as signal rather than as a bug, because funding
+      peaks exactly when the crowd is most extended. A missing snapshot returns None for
+      the whole universe rather than a short dict — funding for some symbols and not
+      others would be one model fitted on two feature sets.
+- [x] Cross-sectional features (2026-09-11): `xs_rank_ret_24`, `xs_rank_ret_168`,
+      `xs_excess_ret_168`, `xs_breadth_200`, `xs_dispersion_24`. The strategy is long-only
+      over a fixed basket, so its real question is *which of these to hold*, and every
+      other feature judges a symbol in isolation — a 5% week is strong when the basket is
+      flat and weak when the basket is up 15%. Warm-up symbols are excluded from each
+      bar's comparison rather than imputed, since ranking against a value that does not
+      exist yet makes early bars quietly wrong instead of missing.
+- [ ] Order book features from rollups (spread/imbalance/depth trends) — **not** gated on
+      the original "4–8 weeks", which was written before the horizon was settled and is
+      badly wrong for a multi-day one. Binance publishes no historical L2, so these can
+      only ever be what has been collected since 2026-08-05; at a 14-day horizon a month of
+      rollups is ~2 non-overlapping windows per symbol, and eight weeks is 4. State the
+      gate in independent windows, not weeks, and expect a later model generation rather
+      than a later month. Open interest is in the same position (~30-day history endpoint).
 - [x] Cross-market features: BTC returns/vol + rolling beta wired in; funding and open
       interest have feature slots and NaN out until the loader supplies them
 - [x] Triple-barrier labeling (`labels.py`), volatility-scaled targets, CUSUM event

@@ -4,10 +4,69 @@ Session question: *is there enough data to start training, or should we wait?*
 Answer: **train now** — waiting buys almost nothing — **and shorten the holding
 horizon**, which buys a lot. Details and the numbers behind them below.
 
-Nothing in `gs_training/` was modified. One new file:
-[training/scripts/horizon_sweep.py](training/scripts/horizon_sweep.py), which
-reproduces every table here. Read this alongside [CHECKLIST.md](CHECKLIST.md);
-the items marked **→ CHECKLIST** at the end should be folded into it.
+Read this alongside [CHECKLIST.md](CHECKLIST.md); the items marked
+**→ CHECKLIST** at the end should be folded into it.
+
+---
+
+## Update — 2026-09-11: the feature audit
+
+Before any of the horizon work below, a second question was asked — *are we even
+using the information we have?* The answer was no, and the gap was larger than
+the horizon question.
+
+**Of 41 declared features the model was receiving 35.** Five were permanently
+NaN and one was an exact duplicate. Neither failure raises: an all-NaN column is
+dropped as an absent optional input, which looks exactly like a feature nobody
+wanted.
+
+The cause was one line. `load_panel` built its panel from
+`("open","high","low","close","volume")` while `KLINE_COLUMNS` had been selecting
+`quote_volume`, `trades`, `taker_buy_volume` and `taker_buy_quote_volume` all
+along — the data was in the Parquet files on disk, back to 2021, and was thrown
+away on the last hop. With no quote volume on the panel, `train.py` passed base
+volume into the quote-volume slot, making `quote_vol_z_168` bit-identical to
+`vol_z_168` across all 49,440 rows.
+
+The expensive loss was `taker_buy_volume`. Aggressor-side flow is the only
+order-flow measurement in this dataset with history back to 2021, and the order
+book — the obvious substitute — can never be backfilled at all.
+
+`test_features.py` could not have caught this: its `synth()` fixture supplies
+every optional input, so the library was always tested with data the pipeline
+never delivered. The new `test_datasets.py` asserts the *loader* contract.
+
+**Fixed, and verified end to end — 46 declared, 45 live:**
+
+| change | effect |
+|---|---|
+| `load_panel` carries `PANEL_COLUMNS` | recovers `taker_buy_frac`, `taker_buy_frac_z_24` |
+| `train.py` passes real `quote_volume` | `quote_vol_z_168` stops duplicating `vol_z_168` |
+| `snapshot_funding` + `align_funding` | recovers `funding_rate`, `funding_ret_24` |
+| `cross_sectional` | adds 5 universe-relative features |
+
+`oi_change_24` is the one remaining NaN, deliberately: Binance's open-interest
+history endpoint serves ~30 days.
+
+**The triage that produced this — apply it to any future "should we collect X":**
+
+- **Already held, not wired** — taker flow, quote volume, trades, funding. Zero
+  wait. This is where everything worth having actually was.
+- **Backfillable, so no wait** — perp klines for spot-perp basis (verified
+  present on data.binance.vision back to 2021), Fear & Greed, macro dailies.
+  Not done; the obvious next source if more is wanted.
+- **Can only accumulate** — order book and open interest. No public L2 history
+  exists, so nothing started today can enter a model evaluated over 2021–2026.
+  Keep collecting for a later generation; do not wait on them.
+
+Note `agg_trades_1m` is *not* worth backfilling: at 1h bars its buy/sell split is
+a re-aggregation of `taker_buy_volume`, which the klines already carry.
+
+**The standing caution.** 45 features against ~3,566 effective observations is
+already a high ratio, so the bar for anything further is not "does it sound
+predictive" but "does it come from a different data-generating process than
+OHLC". More oscillators and lookback variants would make things worse. This is
+also why the LightGBM config wants shallow trees and hard regularisation.
 
 ---
 
@@ -51,15 +110,10 @@ horizon — they are a year-plus away, or they belong to a shorter-horizon model
 Do not let that gate hold anything up; restate it in terms of independent
 windows rather than weeks.
 
-**Funding is a free feature currently going unused.**
-[features.py:276-278](training/gs_training/features.py#L276-L278) has
-`funding_rate` and `funding_ret_24` NaN-ing out because
-[datasets.py](training/gs_training/datasets.py) only snapshots klines
-(`snapshot_klines` / `load_panel` are the only loaders). The archive has funding
-at 8h cadence back to 2021-01-01 for **all ten symbols, no gaps** — exactly the
-same span as the klines. For a long-only swing model this is real signal
-(persistent positive funding = crowded longs). `oi_change_24` stays NaN; only 30
-days of open interest exists.
+**Funding was a free feature going unused — now wired** (see the 2026-09-11
+update above). 62,445 rows at 8h cadence back to 2021-01-01 for all ten symbols,
+no gaps, exactly the same span as the klines. `oi_change_24` stays NaN; only ~30
+days of open interest exists and none of it is backfillable.
 
 ---
 
@@ -196,25 +250,42 @@ The ordering matters: step 1 is now a prerequisite rather than a nicety, because
 the horizon has become a hyperparameter to be searched, and every search burns
 folds.
 
+**Done 2026-09-11:** the feature fixes (panel widening, quote-volume rewiring,
+funding, cross-sectional) — see the update section above. Deliberately sequenced
+*before* the horizon sweep: changing the feature matrix and the label geometry in
+the same step makes the result uninterpretable, and the feature work is
+deterministic repair while the sweep is a search.
+
+Remaining, in order:
+
 1. **Reserve the untouched final holdout.** Already flagged as not-done in
    CHECKLIST.md; it has been promoted from "should" to "must, first." With ~147
    windows per symbol and a 63-point spread between identical random-entry seeds,
-   this is the only defence against fitting the evaluation.
+   this is the only defence against fitting the evaluation — and the horizon is
+   now an explicit search parameter, which makes it worse.
 2. **Fix the uniqueness weighting** (§3). Free, independent of every other
    decision, and it changes the weights that every subsequent experiment uses —
-   so do it before generating results worth keeping.
-3. **Refresh the Parquet cache.** `data/parquet/` ends 2026-08-23; the archive is
-   current. All numbers in this document are from the stale cache — they will
-   shift slightly, not qualitatively.
+   so do it before generating results worth keeping. Still outstanding: the
+   2026-09-11 run still reports `effective n=1445`, the over-conservative figure.
+3. **Refresh the Parquet cache.** `data/parquet/` klines end 2026-08-23; the
+   archive is current. (The funding snapshot taken 2026-09-11 *is* current.) All
+   numbers in this document are from the stale cache — they will shift slightly,
+   not qualitatively.
 4. **Sweep the horizon** on training folds only:
    `max_bars ∈ {84, 168, 336}` × `upper_mult ∈ {0.5, 0.75, 1.0}` with
    `lower_mult = upper_mult/2`. Judge on backtest performance against the
    same-count random-entry band, not on AUC.
-5. **Wire funding into the loader** (§1) and re-run the winning config to measure
-   what it adds. Deliberately *after* the sweep so the horizon choice is not
-   confounded by a simultaneous feature change.
+5. **Only then consider new data.** Spot-perp basis from the futures dumps is the
+   best remaining candidate and needs no waiting. Measure it against the winning
+   horizon config, one source at a time.
 6. **Then** the phase-2 gate: walk-forward beats baselines net of fees across
    ≥2 regimes, and you can explain why.
+
+**Baseline as of 2026-09-11**, with all 45 features live and the stale cache, at
+the current 14-day geometry — recorded so the sweep has something to beat, not
+because it is good: `mean_auc=0.525`, `mean_return=-27.7%` against a
+`-39.3%` random-entry baseline, 2 of 5 folds beating baseline, 2 folds
+abstaining. The model is not yet worth anything; the harness around it is.
 
 ---
 
@@ -241,11 +312,12 @@ Caveats on the numbers:
 
 ## 7. → CHECKLIST
 
-Worth folding into [CHECKLIST.md](CHECKLIST.md) when convenient:
+**Folded in 2026-09-11:** the book-feature gate is restated in independent
+windows rather than weeks; the feature-audit findings, funding wiring and
+cross-sectional block are recorded under phase 1.
 
-- Phase 0 gate: restate the book-feature gate in **independent windows**, not
-  weeks. "4–8 weeks" is wrong for any multi-day horizon and will otherwise be
-  read as "nearly ready."
+Still to fold in:
+
 - Phase 1: the untouched-holdout item is now blocking, not optional.
 - Phase 1: add the uniqueness weighting bug (§3) — it belongs with the other
   "plausible output while being wrong" entries, since nothing about the current
@@ -254,3 +326,8 @@ Worth folding into [CHECKLIST.md](CHECKLIST.md) when convenient:
   observations. That figure is the over-conservative one; the honest number at
   the current spec is ~3,566, and it moves with barrier geometry. Update it
   alongside the fix so the two do not drift.
+- CLAUDE.md's "Features must be causal and prefix-stable" invariant is now
+  enforced in two places, not one: `test_features.py` for the library and
+  `test_cross_sectional.py` for the universe-relative block. Worth naming both,
+  since the cross-sectional features are computed across symbols at one instant
+  and could break the property in a way the per-symbol tests cannot see.

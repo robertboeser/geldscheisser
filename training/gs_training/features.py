@@ -22,10 +22,18 @@ many bars must precede a row for every feature to be finite; rows before that
 must be dropped, not imputed, because an imputed feature is a fabricated
 observation in exactly the way a truncated label is.
 
-Order book features are absent on purpose: the archive holds only ~18 days of
-rollups, far short of the 4–8 week gate, so they join later. Everything here
-comes from klines plus (optionally) funding rates, open interest, and BTC as a
-market-regime reference.
+Inputs are klines, funding rates, open interest, BTC as a market-regime
+reference, and the cross-sectional block computed by `cross_sectional` over the
+whole traded universe. Optional inputs are NaN when absent rather than dropped,
+so the column set never changes shape.
+
+Order book features are absent on purpose, and not merely because the archive is
+short of them: Binance publishes no historical L2, so unlike every other source
+here they can only ever be what has been collected since 2026-08-05. At a
+multi-day horizon that is a handful of non-overlapping windows, so they belong to
+a later model generation rather than to a later month. The same is true of open
+interest, whose history endpoint serves ~30 days — `oi_change_24` is declared and
+will stay NaN for a long while.
 """
 
 from __future__ import annotations
@@ -55,6 +63,16 @@ FEATURE_NAMES: tuple[str, ...] = (
     "btc_ret_24", "btc_ret_168", "btc_vol_100", "beta_btc_168",
     # derivatives sentiment
     "funding_rate", "funding_ret_24", "oi_change_24",
+    # cross-sectional (universe-relative)
+    "xs_rank_ret_24", "xs_rank_ret_168", "xs_excess_ret_168",
+    "xs_breadth_200", "xs_dispersion_24",
+)
+
+# Names `cross_sectional` produces, and the keys `compute_features` reads from
+# its `cross` argument. Split out so the two cannot drift apart silently.
+CROSS_SECTIONAL_NAMES: tuple[str, ...] = (
+    "xs_rank_ret_24", "xs_rank_ret_168", "xs_excess_ret_168",
+    "xs_breadth_200", "xs_dispersion_24",
 )
 
 
@@ -190,6 +208,106 @@ def rolling_beta(x: np.ndarray, y: np.ndarray, w: int) -> np.ndarray:
     return out
 
 
+# --- cross-sectional ---------------------------------------------------------
+# Everything above judges one symbol against its own past. These judge it
+# against its peers at the same instant, which is a different question and the
+# one the strategy actually asks.
+
+def _xs_count(M: np.ndarray) -> np.ndarray:
+    return np.isfinite(M).sum(axis=1)
+
+
+def _xs_mean(M: np.ndarray) -> np.ndarray:
+    """Row-wise mean over finite entries; NaN for an empty row, no warning."""
+    cnt = _xs_count(M)
+    tot = np.where(np.isfinite(M), M, 0.0).sum(axis=1)
+    return np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan)
+
+
+def _xs_rank(M: np.ndarray) -> np.ndarray:
+    """Fraction of live peers each column beats at each row, in [0, 1].
+
+    Symbols still in warm-up are excluded from the comparison rather than
+    treated as zero — ranking against a value that does not exist yet would
+    make early bars quietly wrong rather than missing. A row with fewer than
+    two live symbols has no meaningful ordering and yields NaN.
+    """
+    finite = np.isfinite(M)
+    # beats[i, j, k] is True when symbol j is strictly above symbol k at bar i.
+    beats = (M[:, :, None] > M[:, None, :]) & finite[:, :, None] & finite[:, None, :]
+    n_beaten = beats.sum(axis=2).astype(float)
+    cnt = _xs_count(M)[:, None]
+    out = np.where(cnt > 1, n_beaten / np.maximum(cnt - 1, 1), np.nan)
+    return np.where(finite, out, np.nan)
+
+
+def cross_sectional(
+    panel: dict[str, dict[str, np.ndarray]],
+    *,
+    ema_span: int = 200,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Universe-relative features, one dict per symbol.
+
+    The strategy is long-only over a fixed basket, so its real question is
+    *which of these to hold* — and absolute momentum cannot answer it. A 5%
+    week is strong when the basket is flat and weak when the basket is up 15%.
+    Every other feature in this module is blind to that distinction.
+
+    Causal and prefix-stable by construction: each value at bar `i` is a
+    function of other symbols' causal features **at bar `i` only**. No time
+    window is introduced here, so these inherit the guarantees of the inputs.
+
+    Returns `{symbol: {name: array}}` ready to hand to `compute_features` as
+    its `cross` argument. `xs_breadth_200` and `xs_dispersion_24` describe the
+    universe rather than the symbol, so they are identical across symbols —
+    they are regime context, not a per-symbol measurement.
+    """
+    symbols = list(panel)
+    if not symbols:
+        return {}
+    closes = [np.asarray(panel[s]["close"], dtype=float) for s in symbols]
+    n = closes[0].size
+    if any(c.size != n for c in closes):
+        raise ValueError("cross_sectional needs every symbol on one aligned grid")
+
+    ret24 = np.column_stack([_pct_change(c, 24) for c in closes])
+    ret168 = np.column_stack([_pct_change(c, 168) for c in closes])
+
+    rank24, rank168 = _xs_rank(ret24), _xs_rank(ret168)
+    excess168 = ret168 - _xs_mean(ret168)[:, None]
+
+    # Breadth: share of the universe trading above its own long EMA. Symbols
+    # whose EMA has not warmed up are excluded, not counted as "below".
+    emas = [_ema(c, ema_span) for c in closes]
+    live = np.column_stack([np.isfinite(e) for e in emas])
+    above = np.column_stack([c > e for c, e in zip(closes, emas)]).astype(float)
+    n_live = live.sum(axis=1)
+    breadth = np.where(n_live > 0,
+                       np.where(live, above, 0.0).sum(axis=1) / np.maximum(n_live, 1),
+                       np.nan)
+
+    # Dispersion: cross-sectional spread of 24h returns. High dispersion means
+    # selection can pay; low means everything is just tracking beta.
+    cnt24 = _xs_count(ret24)
+    dev = ret24 - _xs_mean(ret24)[:, None]
+    var = np.where(cnt24 > 1,
+                   (np.where(np.isfinite(dev), dev, 0.0) ** 2).sum(axis=1)
+                   / np.maximum(cnt24 - 1, 1),
+                   np.nan)
+    dispersion = np.sqrt(var)
+
+    return {
+        s: {
+            "xs_rank_ret_24": rank24[:, j],
+            "xs_rank_ret_168": rank168[:, j],
+            "xs_excess_ret_168": excess168[:, j],
+            "xs_breadth_200": breadth,
+            "xs_dispersion_24": dispersion,
+        }
+        for j, s in enumerate(symbols)
+    }
+
+
 # --- the feature set ---------------------------------------------------------
 
 def compute_features(
@@ -202,6 +320,7 @@ def compute_features(
     btc_close: np.ndarray | None = None,
     funding: np.ndarray | None = None,
     open_interest: np.ndarray | None = None,
+    cross: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     """Causal features for one symbol on one bar grid.
 
@@ -278,6 +397,13 @@ def compute_features(
                            if funding is not None else nan)
     f["oi_change_24"] = (_pct_change(np.asarray(open_interest, dtype=float), 24)
                          if open_interest is not None else nan)
+
+    # Computed across symbols by `cross_sectional`, which needs the whole panel
+    # and so cannot run from inside a per-symbol call. Absent → NaN, like every
+    # other optional input, so the column set never changes shape.
+    for name in CROSS_SECTIONAL_NAMES:
+        got = None if cross is None else cross.get(name)
+        f[name] = np.asarray(got, dtype=float) if got is not None else nan
 
     missing = set(FEATURE_NAMES) - set(f)
     extra = set(f) - set(FEATURE_NAMES)
