@@ -19,7 +19,25 @@ for a monthly-ish retrain cadence, worth knowing if you ever want very recent
 data. Heavy experiments should snapshot query results to local Parquet first so
 repeated runs don't hammer the Pi (it is a USB2-attached SSD).
 
-Experiment tracking: `docker compose up -d` → MLflow at http://localhost:5001.
+## Experiment tracking
+
+```sh
+docker --context colima compose -f training/docker-compose.yml up -d   # MLflow on :5001
+```
+
+> **Always pass `--context` here.** This repo's day-to-day Docker context is a
+> *remote* machine (`gs-archive`, and `vps` for the collector), so a bare
+> `docker compose up -d` in this directory starts MLflow **on the Raspberry Pi** —
+> a 4GB box whose whole job is to be a lean archive. It looks like it worked:
+> the container runs, the logs are clean, and only `localhost:5001` being dead
+> gives it away. `docker context ls` shows which one is active.
+
+MLflow is published on **loopback only** (`127.0.0.1:5001`). It has no
+authentication, and the experiment list plus the model registry are not things
+to hand to the LAN; reach it from elsewhere over the tailnet or an SSH tunnel.
+The image also enables Host-header validation by default, hence `--allowed-hosts`
+in the compose file — without it every request is rejected with no useful error.
+
 Trained models are registered here and shipped to the execution VPS.
 
 ## Layout
@@ -91,6 +109,44 @@ Read that carefully, because it is the whole reason this exists:
 - The random-entry spread is **63 points wide** across five seeds with identical
   logic. Any single backtest result inside that band is indistinguishable from
   luck, which is what ~1,456 effectively independent samples buys you.
+
+## The first model
+
+```sh
+python -m gs_training.train --interval 1h --cache-dir data/parquet --splits 5
+```
+
+LightGBM on 41 causal features, uniqueness-weighted, isotonic-calibrated on a
+held-out tail of each training block, thresholded on **expected value** rather
+than probability, and scored by the backtester against a same-count random-entry
+baseline in the same window.
+
+| fold | train | test | AUC | signals | return | baseline | PF |
+|---|---|---|---|---|---|---|---|
+| 0 | 9,962 | 13,033 | 0.523 | 9,054 | −58.1% | −71.0% | 0.61 |
+| 1 | 20,386 | 13,033 | 0.530 | 0 | — | — | — |
+| 2 | 30,810 | 13,033 | 0.504 | 0 | — | — | — |
+| 3 | 41,292 | 13,033 | 0.574 | 416 | +12.3% | +6.0% | 1.40 |
+| 4 | 51,716 | 13,036 | 0.498 | 2,239 | −18.1% | −50.7% | 0.75 |
+
+Mean AUC **0.526** — barely distinguishable from a coin flip. Mean return
+−21.3% against a baseline of −38.6%, beating it in 3 of 3 traded folds, with a
+mean profit factor of 0.92. **It loses money**, and it is nowhere near buy &
+hold's +1084%. That is the expected result for a first model on price-only
+features, and the point of building the harness first is that it says so plainly
+instead of flattering it.
+
+Two details worth reading rather than skipping:
+
+- **Folds 1 and 2 emitted no signal at all**, and that is the EV rule working,
+  not a failure. With a +14%/−7% barrier and 0.3% round-trip costs, EV turns
+  positive only above p≈0.35, and the base rate of a win is ~28%. A calibrated
+  model that never gets confident correctly refuses to trade. Abstentions are
+  reported separately and excluded from the return averages — scoring them as
+  "0% return" would pull a losing strategy toward break-even.
+- **Fold 0 traded 9,054 times and lost 58%.** An early-sample model with almost
+  no training data behind it fires constantly. Signal count per fold is the first
+  thing to look at when a fold looks strange.
 
 ## Sample budget
 

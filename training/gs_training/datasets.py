@@ -101,7 +101,10 @@ def load_panel(
         common = ts if common is None else (common & ts)
     if not common:
         raise ValueError("symbols share no common bars")
-    bar_times = np.array(sorted(common))
+    # datetime64, not an object array of tz-aware datetimes: downstream code
+    # does arithmetic on these, and the object form silently has no .astype.
+    bar_times = np.array([t.replace(tzinfo=None) for t in sorted(common)],
+                         dtype="datetime64[ns]")
 
     panel: dict[str, dict[str, np.ndarray]] = {}
     for s, df in frames.items():

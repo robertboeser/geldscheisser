@@ -163,7 +163,11 @@ between phases are the important part, don't skip them.
 - [x] `docker --context gs-archive compose up -d --build` — both services up, timescaledb healthy
 - [x] `tailscale serve --bg --tcp=5433 tcp://localhost:5433` re-applied on the new node
       (serve config lives in tailscaled state, so a rebuild loses it)
-- [x] Boot-order race closed again: `docker.service` drop-in with `After=/Wants=tailscaled.service`
+- [ ] Boot-order drop-in in place (`docker.service` with `After=/Wants=tailscaled.service`) but
+      the race is **not** actually closed — see the 2026-09-09 blackout below. The unit ordering
+      guarantees tailscaled has *started*, not that the tailnet is up and MagicDNS resolves, so
+      `archive` still crash-loops on `gs-collector` for the first few minutes of every cold boot.
+      Self-heals via `restart: unless-stopped`, so this is robustness polish, not data loss.
 - [x] **Healthcheck race fixed** (`archive/docker-compose.yml`): `pg_isready` now runs with
       `-h 127.0.0.1`. On a fresh volume the postgres entrypoint runs initdb against a temp
       server with `listen_addresses=''`, so the default unix-socket check reported healthy
@@ -198,6 +202,36 @@ between phases are the important part, don't skip them.
       the drop-in exists to guarantee. `tailscale serve` survived (it lives in tailscaled
       state), and the sync-on-start caught up the 156-row delta 3s after the DB was ready.
       The persistent journal also retained the pre-reboot boot, so it works.
+- [x] **Power-cut test PASSED, unplanned** (2026-09-09) — a ~2-minute mains blackout at
+      01:22 CEST, i.e. an unclean power loss mid-write, which is the harsher version of the
+      2026-08-23 reboot test. Everything recovered without intervention in about eight minutes:
+      · Postgres did a clean automatic WAL recovery — `database system was not properly shut
+        down; automatic recovery in progress` → `redo done` → `ready to accept connections`,
+        **no PANIC** (contrast the counterfeit drive: 61 EFSCORRUPTED and a replication
+        checkpoint PANIC). The `invalid record length` line is the normal end-of-WAL marker.
+      · ext4 did an orphan cleanup on mount and remounted r/w; no I/O errors in dmesg.
+      · `archive` crash-looped **13 times** on `socket.gaierror` for `gs-collector` until
+        tailscaled connected (~3.5 min), then synced 74,409 rows. See the boot-order item above.
+      · Verified afterwards against the collector: all four kline intervals **flat** across all
+        10 symbols; below the archive watermark five of six tables match the collector exactly
+        and klines is a strict superset; no stranded rows. The prefix invariant held through an
+        unclean shutdown.
+      · The one apparent shortfall — 1h klines 10 rows short — was the 23:00 candle, which
+        closes after the sync ran. Exactly what `GS_ARCHIVE_SYNC_LAG_S` (7200s, confirmed
+        effective in the container) exists to catch on the next pass. Not a fault.
+- [ ] **The Pi has no RTC — its own log timestamps are wrong for the first minutes after any
+      power loss.** Recorded here because it cost real time during the 2026-09-09 investigation
+      and will do so again. On boot systemd restores the clock from
+      `/var/lib/systemd/timesync/clock` (the last saved value), and NTP only steps it once the
+      network is up — that blackout ran **1h38m slow** until timesyncd corrected it 5 minutes in.
+      Consequences: `journalctl --list-boots` reported the boot 1h38m too early, container
+      `StartedAt` values straddled the boot nonsensically, and the crash-loop window read as
+      1h44m when it was really ~3.5 minutes. The tell is that **`uptime` / `/proc/uptime` and
+      `dmesg -T` are monotonic-based and therefore correct**, while the journal and docker
+      timestamps for that window are not; when they disagree, believe the monotonic ones and
+      look for a `systemd-timesyncd` "Initial clock synchronization" line to find the offset.
+      No data is affected — every row timestamp originates from Binance via the collector, never
+      from the Pi's clock. Fixable with a cheap I2C RTC module (DS3231) if it becomes annoying.
 - [ ] **Ethernet not yet working.** A cable was attached 2026-08-23 but the link carries no
       traffic: carrier up and 100Mb/s negotiated, yet `rx_packets=0` against 66 DHCP DISCOVERs
       sent, NetworkManager cycling on `ip-config-unavailable`, and eth0 now DOWN. Zero inbound
@@ -221,7 +255,16 @@ between phases are the important part, don't skip them.
       archive lacks, across all six tables; archive retention still absent; all intervals flat;
       no unexpected holes. The archive is a strict superset — it also carries 457 klines the
       *collector* is missing, live-collection gaps the backfill repaired from the dumps/REST.
-- [ ] Archive survives a missed sync window (stop it a few days, verify catch-up on restart)
+- [x] **Archive survives a missed sync window** — run for real in August 2026 by leaving the
+      archive shut down for roughly a week (2026-08-23 → 08-30). Catch-up on resume moved
+      **855,543 rows** in a single sync and the result is contiguous: 240/240 hourly candles
+      per day for every day of the outage, 08-24 through 08-29 inclusive. Two things made it
+      safe rather than lucky, and both are worth keeping in mind before repeating it: the gap
+      must stay inside the collector's 90-day retention, and the sync's forward-only watermark
+      means catch-up only works because nothing else wrote to the archive meanwhile.
+      Note for future forensics: a week-long outage leaves *no* trace in the container log —
+      `sync_loop` logs its startup line only in `main()`, so a resumed process is silent about
+      having been away. The gap is visible only as a missing daily `sync complete` line.
 - [ ] Backup story for the SSD decided (even rsync of weekly pg_dump is fine)
 - [ ] Consider retry-with-backoff on a failed sync: `sync_loop` sleeps the full interval after
       *any* failure, so one transient error costs a day of freshness (and Wi-Fi flaps make
@@ -235,21 +278,34 @@ continuous order book rollups in the archive before book features join the model
 
 ## Phase 1 — Training (Mac, `training/`)
 
-- [ ] MLflow up (`cd training && docker compose up -d`)
+- [x] MLflow up — `docker --context colima compose -f training/docker-compose.yml up -d`,
+      healthy with a healthcheck and 0 restarts
 - [x] Dataset export: archive Postgres → local Parquet snapshots (`datasets.py`),
       plus `load_panel` for an inner-joined multi-symbol bar grid. Read-only by
       construction: connects with raw asyncpg rather than `gs_common.create_pool`,
       which would apply schema DDL to the archive of record.
-- [ ] Feature library (`features.py`) — multi-timeframe price/trend/volume features
-- [ ] Order book features from rollups (spread/imbalance/depth trends)
-- [ ] Cross-market features (BTC regime, funding, open interest)
+- [x] Feature library (`features.py`) — 41 causal features: multi-timeframe returns,
+      EMA distances, RSI/MACD/Bollinger, ATR and realized vol, candle shape, breakout
+      distance, volume/flow z-scores, cyclical calendar, BTC regime + rolling beta.
+      Two properties are asserted by tests rather than assumed, because a violation of
+      either produces a model that backtests well and loses money live: **causality**
+      (mutating the tail of a series must not change any earlier value) and
+      **prefix-stability** (computing on `close[:k]` matches the full-series result for
+      the first `k` rows — which is exactly what live inference does).
+- [ ] Order book features from rollups (spread/imbalance/depth trends) — gated on the
+      4–8 week rollup accumulation, not on code
+- [x] Cross-market features: BTC returns/vol + rolling beta wired in; funding and open
+      interest have feature slots and NaN out until the loader supplies them
 - [x] Triple-barrier labeling (`labels.py`), volatility-scaled targets, CUSUM event
       sampling. Volatility is scaled to the holding period (`sigma·sqrt(max_bars)`) —
       feeding a per-bar sigma into a 336-bar horizon put the barriers ~18x too close,
       so nothing ever reached the vertical barrier and the labels silently described
       scalping rather than swing trading.
 - [x] Baselines: buy-and-hold, SMA cross, random-entry-same-exit (`baselines.py`)
-- [ ] LightGBM classifier + calibrated probabilities
+- [x] LightGBM classifier + isotonic calibration on a held-out tail of each training
+      block (`train.py`), with uniqueness sample weights, and an **expected-value**
+      decision rule rather than `p > 0.5` — the barrier geometry and fees are what turn
+      a probability into a trade
 - [x] Walk-forward validation with purge + embargo (`splits.py`), plus
       `assert_no_leakage` (called per fold in every experiment) and
       `average_uniqueness` for overlap-aware sample weights
@@ -276,7 +332,20 @@ random-entry band (−14.8% … +48.5% across 5 seeds), while equal-weight buy &
 returns +1084.5%. The 63-point spread between identical-logic random seeds is the
 number to keep in mind: any single backtest result inside that band is luck, which is
 what ~1,456 effectively independent samples buys.
-- [ ] Experiment log in MLflow; untouched final holdout period reserved
+- [x] MLflow logging (best-effort; a dead tracking server must never lose a run — and
+      capped at one retry, since mlflow's default backoff spends over a minute failing
+      to reach a server that simply is not running). Published on **loopback only** —
+      it has no auth and holds the model registry. Needed two fixes on the current
+      image: `--allowed-hosts` (Host-header validation is on by default and rejects
+      everything with no useful error) and `--workers 1` (four workers OOM-crashloop
+      in colima's ~2GB VM; the container reported "Up 3 seconds" on every check).
+- [ ] Untouched final holdout period reserved — **not yet done**, and it should be
+      before any serious tuning starts: every experiment against these folds burns them.
+- [x] **Docker context trap, hit and documented** (2026-08-23): this repo's active
+      context is a *remote* machine, so a bare `docker compose up -d` in `training/`
+      started MLflow **on the Raspberry Pi**. It looked like it worked — container up,
+      clean logs — and only a dead `localhost:5001` gave it away. Removed from the Pi
+      (volume included, archive stack verified untouched); always pass `--context`.
 
 **Gate → phase 2:** walk-forward backtest beats baselines net of fees across
 ≥2 market regimes, and you understand *why* it works.

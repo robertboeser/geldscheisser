@@ -8,10 +8,21 @@ services:
       mlflow server --host 0.0.0.0 --port 5000
       --backend-store-uri sqlite:////mlflow/mlflow.db
       --artifacts-destination /mlflow/artifacts
+      --allowed-hosts localhost:5001,127.0.0.1:5001,localhost,127.0.0.1
+      --workers 1
     ports:
-      - "5001:5000"
+      # Loopback only. MLflow has no auth, and the published port would
+      # otherwise expose every experiment (and the model registry) to the LAN.
+      # Reach it from another machine over the tailnet or an SSH tunnel.
+      - "127.0.0.1:5001:5000"
     volumes:
       - mlflowdata:/mlflow
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:5000/health',timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
 
 volumes:
   mlflowdata:

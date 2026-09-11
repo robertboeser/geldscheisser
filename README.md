@@ -1,7 +1,8 @@
 # Geldscheißer
 
 AI crypto swing-trading broker for Binance. See [PLAN.md](PLAN.md) for the full
-roadmap and [CHECKLIST.md](CHECKLIST.md) for implementation progress.
+roadmap, [CHECKLIST.md](CHECKLIST.md) for implementation progress, and
+[CLAUDE.md](CLAUDE.md) for the invariants that are easy to violate.
 
 The project is split by deployment target — four modules, four machines:
 
@@ -140,7 +141,7 @@ why `GS_ARCHIVE_BATCH_SIZE` is lowered on a 4GB Pi.
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install -e common -e 'collector[dev]' -e 'archive[dev]'
+.venv/bin/pip install -e common -e 'collector[dev]' -e 'archive[dev]' -e 'training[dev]'
 .venv/bin/pytest common/tests collector/tests archive/tests training/tests   # unit tests
 .venv/bin/gs orderbook                           # run a collector service against GS_DATABASE_URL
 ```
@@ -151,4 +152,6 @@ and [common/gs_common/config.py](common/gs_common/config.py) for all knobs.
 
 Training (phase 1) reads the Pi's archive over the tailnet
 (`postgresql://gs:gs@gs-archive:5433/geldscheisser`) and tracks experiments
-in MLflow: `cd training && docker compose up -d` → http://localhost:5001.
+in MLflow: `docker --context colima compose -f training/docker-compose.yml up -d`
+→ http://localhost:5001. Pass `--context` — this repo's active Docker context is a
+*remote* machine, so a bare `docker compose up -d` starts MLflow on the Pi.
