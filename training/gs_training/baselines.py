@@ -59,13 +59,17 @@ def buy_and_hold(symbol: str, first_bar: int = 0) -> list[Signal]:
 
 def random_entries(
     n_signals: int, n_bars: int, symbols: list[str], seed: int = 0,
-    first_bar: int = 0, last_bar: int | None = None,
+    first_bar: int = 0, last_bar: int | None = None, side: int | None = None,
 ) -> list[Signal]:
     """`n_signals` uniformly random entries — the same-exit-rule control.
 
     Seeded, because a baseline that changes between runs cannot be a baseline.
     Compare against it across several seeds: a single random draw has enough
     variance to flatter or damn a model by luck.
+
+    `side` must match the strategy under test (`None` follows the backtest's
+    spec). A short model scored against random *longs* measures the market's
+    drift, not the model.
     """
     hi = n_bars if last_bar is None else min(last_bar, n_bars)
     if hi <= first_bar or not symbols or n_signals <= 0:
@@ -73,4 +77,4 @@ def random_entries(
     rng = np.random.default_rng(seed)
     bars = rng.integers(first_bar, hi, size=n_signals)
     picks = rng.integers(0, len(symbols), size=n_signals)
-    return [Signal(bar=int(b), symbol=symbols[int(p)]) for b, p in zip(bars, picks)]
+    return [Signal(bar=int(b), symbol=symbols[int(p)], side=side) for b, p in zip(bars, picks)]

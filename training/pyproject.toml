@@ -24,6 +24,7 @@ dev = [
 [project.scripts]
 gs-datasets = "gs_training.datasets:main"
 gs-train = "gs_training.train:main"
+gs-compare-sides = "gs_training.compare_sides:main"
 
 [build-system]
 requires = ["hatchling"]

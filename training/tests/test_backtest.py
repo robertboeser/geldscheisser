@@ -11,7 +11,7 @@ from gs_training.backtest import (
     summarize,
 )
 from gs_training.baselines import buy_and_hold, random_entries, sma_cross
-from gs_training.labels import LOSS, WIN, BarrierSpec
+from gs_training.labels import LONG, LOSS, SHORT, WIN, BarrierSpec
 from gs_training.metrics import max_drawdown, performance, profit_factor, sharpe, stress_test
 
 FREE = CostModel(fee_rate=0.0, slippage_bps=0.0)
@@ -179,3 +179,129 @@ class TestAccountingInvariants:
         # Every trade scan_barriers resolves has exit_i < n, so all must close.
         assert r.final_equity == pytest.approx(
             r.starting_cash + sum(t.pnl for t in r.trades), rel=1e-9)
+
+
+FREE_PERP = CostModel(fee_rate=0.0, slippage_bps=0.0, venue="perp")
+
+
+def no_funding(n, symbol="BTCUSDT"):
+    return {symbol: np.zeros(n)}
+
+
+class TestShorts:
+    def test_a_falling_market_is_a_short_win(self):
+        bars = flat_panel(rising(120, start=300.0, step=-2.0))
+        r = run_backtest(bars, [Signal(bar=5, symbol="BTCUSDT")],
+                         BarrierSpec(2, 1, 50, scale_by_horizon=False, side=SHORT),
+                         {"BTCUSDT": np.full(120, 0.05)}, FREE_PERP, Portfolio(),
+                         no_funding(120))
+        t = r.trades[0]
+        assert t.side == SHORT and t.outcome == WIN and t.pnl > 0
+
+    def test_short_pnl_mirrors_long_pnl_without_costs(self):
+        """Same entry, same symmetric barriers, a gap-free path: a short makes
+        exactly what the long loses. A sign error anywhere breaks this."""
+        c = rising(121, start=300.0, step=-2.0)
+        o = np.r_[c[0], c[:-1]]                      # each bar opens at the last close
+        bars = {"BTCUSDT": {"open": o, "high": np.maximum(o, c), "low": np.minimum(o, c),
+                            "close": c, "volume": np.ones_like(c)}}
+        sigma = {"BTCUSDT": np.full(121, 0.05)}
+        spec = BarrierSpec(1, 1, 50, scale_by_horizon=False)
+        lg = run_backtest(bars, [Signal(5, "BTCUSDT", LONG)], spec, sigma,
+                          FREE_PERP, Portfolio(), no_funding(121))
+        sh = run_backtest(bars, [Signal(5, "BTCUSDT", SHORT)], spec, sigma,
+                          FREE_PERP, Portfolio(), no_funding(121))
+        assert lg.trades[0].outcome == LOSS and sh.trades[0].outcome == WIN
+        assert sh.trades[0].pnl == pytest.approx(-lg.trades[0].pnl)
+
+    def test_gaps_hurt_both_sides_never_help(self):
+        """With gaps the mirror breaks, and only in the pessimistic direction:
+        a gapped stop fills at the open, a gapped target only at the target."""
+        bars = flat_panel(rising(120, start=300.0, step=-2.0))
+        sigma = {"BTCUSDT": np.full(120, 0.05)}
+        spec = BarrierSpec(1, 1, 50, scale_by_horizon=False)
+        lg = run_backtest(bars, [Signal(5, "BTCUSDT", LONG)], spec, sigma,
+                          FREE_PERP, Portfolio(), no_funding(120))
+        sh = run_backtest(bars, [Signal(5, "BTCUSDT", SHORT)], spec, sigma,
+                          FREE_PERP, Portfolio(), no_funding(120))
+        assert sh.trades[0].pnl + lg.trades[0].pnl < 0
+
+    def test_signal_defaults_to_the_spec_side(self):
+        bars = flat_panel(rising(120))
+        r = run_backtest(bars, [Signal(bar=5, symbol="BTCUSDT")],
+                         BarrierSpec(2, 1, 50, scale_by_horizon=False, side=SHORT),
+                         {"BTCUSDT": np.full(120, 0.05)}, FREE_PERP, Portfolio(),
+                         no_funding(120))
+        assert r.trades[0].side == SHORT and r.trades[0].outcome == LOSS
+
+    def test_spot_refuses_to_short(self):
+        bars = flat_panel(rising(120))
+        with pytest.raises(ValueError, match="spot cannot short"):
+            run_backtest(bars, [Signal(5, "BTCUSDT", SHORT)], BarrierSpec(2, 1, 50),
+                         {"BTCUSDT": np.full(120, 0.05)}, FREE, Portfolio())
+
+    def test_short_equity_equals_starting_cash_plus_realised_pnl(self):
+        bars = flat_panel(np.r_[rising(200, 300, -1.0), rising(200, 100, 1.0)])
+        sigma = {"BTCUSDT": np.full(400, 0.02)}
+        fund = {"BTCUSDT": np.where(np.arange(400) % 8 == 0, 0.0003, 0.0)}
+        sigs = [Signal(b, "BTCUSDT", SHORT if b % 2 else LONG) for b in range(10, 300, 7)]
+        r = run_backtest(bars, sigs, BarrierSpec(1, 0.5, 60, scale_by_horizon=False),
+                         sigma, CostModel.perp(), Portfolio(), fund)
+        assert {t.side for t in r.trades} == {LONG, SHORT}
+        realised = sum(t.pnl for t in r.trades)
+        assert r.final_equity == pytest.approx(r.starting_cash + realised, rel=1e-9)
+
+    def test_slippage_works_against_a_short_both_ways(self):
+        bars = flat_panel(rising(120, start=300.0, step=-2.0))
+        r = run_backtest(bars, [Signal(5, "BTCUSDT", SHORT)],
+                         BarrierSpec(2, 1, 50, scale_by_horizon=False),
+                         {"BTCUSDT": np.full(120, 0.05)},
+                         CostModel(0.0, 10.0, venue="perp"), Portfolio(), no_funding(120))
+        t = r.trades[0]
+        # Entry: sell at bar 6's open (288) into the bid. Exit: the -10% target
+        # (259.2), bought back at the ask.
+        assert t.entry_px == pytest.approx(288.0 * (1 - 0.001))
+        assert t.exit_px == pytest.approx(288.0 * 0.9 * (1 + 0.001))
+
+
+class TestFunding:
+    def _run(self, side, rate):
+        bars = flat_panel(np.full(100, 100.0))
+        fund = {"BTCUSDT": np.where(np.arange(100) % 8 == 0, rate, 0.0)}
+        return run_backtest(bars, [Signal(5, "BTCUSDT", side)],
+                            BarrierSpec(5, 5, 40, scale_by_horizon=False),
+                            {"BTCUSDT": np.full(100, 0.05)}, FREE_PERP, Portfolio(), fund)
+
+    def test_positive_funding_credits_shorts_and_charges_longs(self):
+        sh, lg = self._run(SHORT, 0.001), self._run(LONG, 0.001)
+        # Flat price -> timeout at bar 6+40-1=45; settlements at 8..40 = 5 prints,
+        # each 0.1% of a 1,000 notional.
+        assert sh.trades[0].funding == pytest.approx(5.0)
+        assert lg.trades[0].funding == pytest.approx(-5.0)
+        assert sh.trades[0].pnl == pytest.approx(5.0)
+
+    def test_funding_is_in_equity_as_it_accrues(self):
+        r = self._run(SHORT, 0.001)
+        assert r.equity[8] - r.equity[7] == pytest.approx(1.0)
+        assert r.final_equity == pytest.approx(r.starting_cash + 5.0)
+
+    def test_entry_bar_settlement_is_not_charged(self):
+        bars = flat_panel(np.full(100, 100.0))
+        fund = {"BTCUSDT": np.zeros(100)}
+        fund["BTCUSDT"][6] = 0.01                      # settles on the entry bar
+        r = run_backtest(bars, [Signal(5, "BTCUSDT", LONG)],
+                         BarrierSpec(5, 5, 40, scale_by_horizon=False),
+                         {"BTCUSDT": np.full(100, 0.05)}, FREE_PERP, Portfolio(), fund)
+        assert r.trades[0].funding == 0.0
+
+    def test_perp_requires_funding_and_spot_refuses_it(self):
+        bars = flat_panel(np.full(100, 100.0))
+        args = ([Signal(5, "BTCUSDT")], BarrierSpec(5, 5, 40), {"BTCUSDT": np.full(100, 0.05)})
+        with pytest.raises(ValueError, match="funding"):
+            run_backtest(bars, *args, FREE_PERP, Portfolio())
+        with pytest.raises(ValueError, match="funding"):
+            run_backtest(bars, *args, FREE, Portfolio(), no_funding(100))
+
+    def test_perp_preset_is_cheaper_than_spot(self):
+        assert CostModel.perp().fee_rate < CostModel().fee_rate
+        assert CostModel.perp().venue == "perp"

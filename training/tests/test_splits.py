@@ -6,7 +6,12 @@ or look wrong, it just makes a worthless model look excellent."""
 import numpy as np
 import pytest
 
-from gs_training.splits import assert_no_leakage, average_uniqueness, walk_forward
+from gs_training.splits import (
+    assert_no_leakage,
+    average_uniqueness,
+    holdout_split,
+    walk_forward,
+)
 
 HORIZON = 336  # 14 days of 1h bars
 
@@ -104,3 +109,72 @@ class TestAverageUniqueness:
         e = t + rng.uniform(1, 100, 200)
         u = average_uniqueness(e, t)
         assert np.all((u > 0) & (u <= 1.0 + 1e-9))
+
+
+class TestHoldoutSplit:
+    """The holdout only means something if nothing can quietly reach into it."""
+
+    def test_no_development_label_resolves_inside_the_holdout(self):
+        # cut well past the horizon, or there is no room for a dev sample at all
+        t, end = events(1000)
+        cut = 500.0
+        dev, _ = holdout_split(t, end, cut)
+        assert dev.any()
+        assert (end[dev] < cut).all()
+
+    def test_holdout_is_exactly_the_events_decided_after_the_cut(self):
+        t, end = events(1000)
+        cut = 500.0
+        _, hold = holdout_split(t, end, cut)
+        assert (t[hold] >= cut).all()
+        assert (t[~hold] < cut).all()
+
+    def test_the_boundary_band_belongs_to_neither_side(self):
+        # The whole point: with a 336-bar horizon, events in the 336 bars before
+        # the cut resolve inside the holdout and must be dropped, not assigned.
+        t, end = events(1000)
+        cut = 500.0
+        dev, hold = holdout_split(t, end, cut)
+        assert not (dev & hold).any()
+        dropped = ~(dev | hold)
+        assert dropped.sum() == HORIZON
+        assert (t[dropped] < cut).all() and (end[dropped] >= cut).all()
+
+    def test_a_longer_horizon_costs_a_wider_band(self):
+        t, short = events(1000, horizon=24)
+        _, long_ = events(1000, horizon=336)
+        d_short, h_short = holdout_split(t, short, 500.0)
+        d_long, h_long = holdout_split(t, long_, 500.0)
+        assert (~(d_long | h_long)).sum() > (~(d_short | h_short)).sum()
+        assert h_short.sum() == h_long.sum()   # only the dev side pays
+
+    def test_cut_past_the_data_yields_an_empty_holdout_not_a_wrong_one(self):
+        t, end = events(100)
+        dev, hold = holdout_split(t, end, 10_000.0)
+        assert hold.sum() == 0
+        assert dev.all()
+
+    def test_cut_before_the_data_reserves_everything(self):
+        t, end = events(100)
+        dev, hold = holdout_split(t, end, -1.0)
+        assert hold.all()
+        assert dev.sum() == 0
+
+    def test_rejects_mismatched_lengths(self):
+        with pytest.raises(ValueError):
+            holdout_split(np.arange(10), np.arange(9), 5.0)
+
+    def test_walk_forward_on_the_dev_side_never_sees_the_holdout(self):
+        # The composition that actually matters: fold generation is applied to
+        # the development subset, so no fold's training or test block may carry
+        # a label that resolves past the cut.
+        t, end = events(2000)
+        cut = 1500.0
+        dev, _ = holdout_split(t, end, cut)
+        td, ed = t[dev], end[dev]
+        folds = walk_forward(td, ed, n_splits=5, embargo=HORIZON)
+        assert folds
+        for f in folds:
+            assert_no_leakage(f, td, ed, embargo=HORIZON)
+            assert ed[f.train_idx].max() < cut
+            assert ed[f.test_idx].max() < cut

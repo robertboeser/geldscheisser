@@ -97,6 +97,7 @@ def stress_test(
     costs: CostModel = CostModel(),
     portfolio: Portfolio = Portfolio(),
     drop_best: int = 5,
+    funding: dict[str, np.ndarray] | None = None,
 ) -> dict[str, dict[str, float]]:
     """Re-run the backtest under adversarial variations.
 
@@ -106,15 +107,16 @@ def stress_test(
     - `drop_best_n` — remove the largest winners. If the result depends on a
       handful of trades, it is a sample of lucky fills, not an edge.
     """
-    base = run_backtest(bars, signals, spec, sigma, costs, portfolio)
+    base = run_backtest(bars, signals, spec, sigma, costs, portfolio, funding)
     out = {"base": performance(base)}
 
     out["double_fees"] = performance(run_backtest(
-        bars, signals, spec, sigma, replace(costs, fee_rate=costs.fee_rate * 2), portfolio))
+        bars, signals, spec, sigma, replace(costs, fee_rate=costs.fee_rate * 2), portfolio,
+        funding))
 
-    delayed = [Signal(bar=s.bar + 1, symbol=s.symbol) for s in signals]
+    delayed = [replace(s, bar=s.bar + 1) for s in signals]
     out["delayed_entry"] = performance(run_backtest(
-        bars, delayed, spec, sigma, costs, portfolio))
+        bars, delayed, spec, sigma, costs, portfolio, funding))
 
     trimmed = BacktestResult(
         trades=sorted(base.trades, key=lambda t: t.pnl)[:-drop_best] if drop_best else list(base.trades),

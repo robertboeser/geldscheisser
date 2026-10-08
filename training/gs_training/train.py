@@ -16,6 +16,12 @@ The shape of an honest run, and why each step is here:
    in the same window. Accuracy and AUC are reported but are not the verdict —
    a classifier can be right most of the time and still lose money.
 
+**Sides.** `--side short` trains a separate model whose target is the short
+barrier pair (`BarrierSpec.side = -1`): price falling to the target before
+rising to the stop. Shorts only exist on the perp venue, where fees are lower
+and funding is a real cash flow, so `--venue perp` also books funding from the
+archive. The random baseline always trades the same side as the model.
+
 **Timeouts count as not-win.** The classifier is binary: did the profit barrier
 get hit first. Expected value then assumes a non-win pays the full stop, which
 is pessimistic — a timeout usually exits nearer to flat than to the stop. That
@@ -27,14 +33,14 @@ from __future__ import annotations
 import argparse
 import logging
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 
-from .backtest import CostModel, Portfolio, Signal, run_backtest
+from .backtest import PERP, CostModel, Portfolio, Signal, Trade, run_backtest
 from .baselines import random_entries
-from .datasets import DEFAULT_CACHE, align_funding, load_panel
+from .datasets import DEFAULT_CACHE, align_funding, funding_settlements, load_panel
 from .features import (
     FEATURE_NAMES,
     MAX_LOOKBACK,
@@ -43,9 +49,15 @@ from .features import (
     feature_matrix,
     usable_mask,
 )
-from .labels import WIN, BarrierSpec, cusum_events, ewm_volatility, label_events
+from .labels import LONG, SHORT, WIN, BarrierSpec, cusum_events, ewm_volatility, label_events
 from .metrics import performance
-from .splits import assert_no_leakage, average_uniqueness, walk_forward
+from .splits import (
+    HOLDOUT_START,
+    assert_no_leakage,
+    average_uniqueness,
+    holdout_split,
+    walk_forward,
+)
 
 log = logging.getLogger(__name__)
 
@@ -55,17 +67,33 @@ class Dataset:
     """Model matrix plus everything needed to split and evaluate it honestly."""
 
     X: np.ndarray                 # (n, n_features)
-    y: np.ndarray                 # 1 = profit barrier hit first
+    y: np.ndarray                 # 1 = profit barrier (for the spec's side) hit first
     event_bar: np.ndarray         # decision bar on the shared grid
     label_end_bar: np.ndarray     # last bar the label depends on (for purging)
     weight: np.ndarray            # average uniqueness, per symbol
     symbol: np.ndarray            # symbol per row
-    up_ret: np.ndarray            # barrier distances at the decision bar,
-    dn_ret: np.ndarray            # used for the expected-value rule
+    up_ret: np.ndarray            # target / stop distances at the decision bar,
+    dn_ret: np.ndarray            # as positive fractions on either side; for the EV rule
     feature_names: tuple[str, ...] = FEATURE_NAMES
 
     def __len__(self) -> int:
         return self.X.shape[0]
+
+    def select(self, mask: np.ndarray) -> "Dataset":
+        """Row subset, keeping every parallel array in step.
+
+        Uniqueness weights are **not** recomputed. They describe how much of its
+        label window each event shares with its neighbours in the full sample,
+        and that is the honest figure: dropping the neighbours from the matrix
+        does not make the remaining events more independent than they were.
+        """
+        mask = np.asarray(mask)
+        return Dataset(
+            X=self.X[mask], y=self.y[mask], event_bar=self.event_bar[mask],
+            label_end_bar=self.label_end_bar[mask], weight=self.weight[mask],
+            symbol=self.symbol[mask], up_ret=self.up_ret[mask],
+            dn_ret=self.dn_ret[mask], feature_names=self.feature_names,
+        )
 
 
 def build_dataset(
@@ -75,8 +103,22 @@ def build_dataset(
     spec: BarrierSpec = BarrierSpec(),
     vol_span: int = 100,
     cusum_mult: float = 2.0,
+    split: str = "dev",
 ) -> tuple[Dataset, np.ndarray, dict[str, dict[str, np.ndarray]], dict[str, np.ndarray]]:
-    """Build the training matrix. Returns `(dataset, bar_times, panel, sigma)`."""
+    """Build the training matrix. Returns `(dataset, bar_times, panel, sigma)`.
+
+    `split` selects which side of `HOLDOUT_START` is returned:
+
+    - `"dev"` (default) — development data only. This is the default because the
+      safe thing must be what happens when nobody thought about it.
+    - `"holdout"` — the reserved tail, for the single final evaluation.
+    - `"all"` — everything, for data-quality reporting. Not for fitting.
+
+    The panel and sigma are always returned whole: the backtester marks to market
+    across a position's full life, and a holdout trade opened near the boundary
+    resolves on bars that belong to neither side of it. Only the *event* rows are
+    partitioned, which is where the leak would be.
+    """
     bar_times, panel = load_panel(symbols, interval, cache_dir)
     btc = panel.get("BTCUSDT", {}).get("close")
     # Both need the whole panel, so they are computed once rather than per symbol.
@@ -135,7 +177,36 @@ def build_dataset(
         label_end_bar=np.concatenate(ends), weight=np.concatenate(ws),
         symbol=np.concatenate(syms), up_ret=np.concatenate(ups), dn_ret=np.concatenate(dns),
     )
+    if split != "all":
+        ds = _apply_holdout(ds, bar_times, split)
     return ds, bar_times, panel, sigma
+
+
+def holdout_bar(bar_times: np.ndarray) -> float:
+    """`HOLDOUT_START` as a position on the panel's bar grid.
+
+    Returns `len(bar_times)` when the boundary is past the end of the data, so a
+    cache that has not been refreshed past it yields an empty holdout rather than
+    a silently mislabelled one.
+    """
+    cut = np.datetime64(HOLDOUT_START.replace(tzinfo=None), "ns")
+    return float(np.searchsorted(np.asarray(bar_times), cut, side="left"))
+
+
+def _apply_holdout(ds: Dataset, bar_times: np.ndarray, split: str) -> Dataset:
+    if split not in ("dev", "holdout"):
+        raise ValueError(f"split must be 'dev', 'holdout' or 'all', got {split!r}")
+    cut = holdout_bar(bar_times)
+    dev, hold = holdout_split(ds.event_bar, ds.label_end_bar, cut)
+    n_purged = len(ds) - int(dev.sum()) - int(hold.sum())
+    log.info("holdout at %s (bar %d): dev=%d, holdout=%d, purged at the boundary=%d",
+             HOLDOUT_START.date(), int(cut), int(dev.sum()), int(hold.sum()), n_purged)
+    if split == "holdout" and hold.sum() == 0:
+        raise ValueError(
+            f"holdout is empty — the cache ends before {HOLDOUT_START.date()}. "
+            "Refresh it with `python -m gs_training.datasets`."
+        )
+    return ds.select(dev if split == "dev" else hold)
 
 
 def expected_value(p_win: np.ndarray, up_ret: np.ndarray, dn_ret: np.ndarray,
@@ -179,6 +250,12 @@ class FoldResult:
     n_signals: int
     strategy: dict[str, float] = field(default_factory=dict)
     baseline: dict[str, float] = field(default_factory=dict)
+    # Backtest window on the full panel, and what was traded in it, on
+    # *absolute* bar indices — kept so a fold can be re-read by regime or
+    # re-run in a combined portfolio without refitting.
+    window: tuple[int, int] = (0, 0)
+    signals: list[Signal] = field(default_factory=list)
+    trades: list[Trade] = field(default_factory=list)
 
 
 def train_walk_forward(
@@ -194,8 +271,13 @@ def train_walk_forward(
     portfolio: Portfolio = Portfolio(),
     lgb_params: dict | None = None,
     seed: int = 0,
+    funding: dict[str, np.ndarray] | None = None,
 ) -> list[FoldResult]:
-    """Fit, calibrate, threshold and backtest each walk-forward fold."""
+    """Fit, calibrate, threshold and backtest each walk-forward fold.
+
+    The side comes from `spec`; `funding` (settlements on the full panel grid)
+    is required when `costs.venue` is perp.
+    """
     import lightgbm as lgb
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.metrics import brier_score_loss, roc_auc_score
@@ -253,23 +335,36 @@ def train_walk_forward(
         hi = min(hi, len(next(iter(panel.values()))["close"]))
         sub = slice_panel(panel, lo, hi)
         sub_sigma = {s: v[lo:hi] for s, v in sigma.items()}
+        sub_funding = None if funding is None else {s: v[lo:hi] for s, v in funding.items()}
 
-        sigs = [Signal(bar=int(b) - lo, symbol=str(s))
+        sigs = [Signal(bar=int(b) - lo, symbol=str(s), side=spec.side)
                 for b, s in zip(ds.event_bar[te][take], ds.symbol[te][take])]
-        strat = performance(run_backtest(sub, sigs, spec, sub_sigma, costs, portfolio))
+        bt = run_backtest(sub, sigs, spec, sub_sigma, costs, portfolio, sub_funding)
+        strat = performance(bt)
         base = performance(run_backtest(
-            sub, random_entries(len(sigs), hi - lo, sorted(panel), seed=seed + k),
-            spec, sub_sigma, costs, portfolio))
+            sub, random_entries(len(sigs), hi - lo, sorted(panel), seed=seed + k,
+                                side=spec.side),
+            spec, sub_sigma, costs, portfolio, sub_funding))
 
         results.append(FoldResult(
             fold=k, n_train=int(fit_idx.size), n_test=int(te.size),
             auc=auc, brier=brier, n_signals=int(take.sum()),
-            strategy=strat, baseline=base,
+            strategy=strat, baseline=base, window=(lo, hi),
+            signals=[Signal(bar=s.bar + lo, symbol=s.symbol, side=s.side) for s in sigs],
+            trades=[_shift(t, lo) for t in bt.trades],
         ))
         log.info("fold %d: auc=%.3f signals=%d ret=%+.1f%% (baseline %+.1f%%)",
                  k, auc, take.sum(), strat["total_return"] * 100,
                  base["total_return"] * 100)
     return results
+
+
+def _shift(t: Trade, offset: int) -> Trade:
+    return replace(t, entry_i=t.entry_i + offset, exit_i=t.exit_i + offset)
+
+
+def costs_for(venue: str) -> CostModel:
+    return CostModel.perp() if venue == PERP else CostModel()
 
 
 def aggregate(results: list[FoldResult]) -> dict[str, float]:
@@ -309,6 +404,7 @@ def aggregate(results: list[FoldResult]) -> dict[str, float]:
         "mean_profit_factor": float(np.mean(pf[np.isfinite(pf)])) if np.isfinite(pf).any() else 0.0,
         "mean_max_drawdown": float(np.mean([r.strategy["max_drawdown"] for r in traded])),
         "mean_sharpe": float(np.mean([r.strategy["sharpe"] for r in traded])),
+        "total_funding": float(sum(r.strategy.get("total_funding", 0.0) for r in traded)),
     }
 
 
@@ -355,21 +451,52 @@ def main() -> None:
     p.add_argument("--upper", type=float, default=1.0)
     p.add_argument("--lower", type=float, default=0.5)
     p.add_argument("--ev-threshold", type=float, default=0.0)
+    p.add_argument("--side", choices=("long", "short"), default="long")
+    p.add_argument("--venue", choices=("spot", "perp"), default="spot",
+                   help="perp: USDⓈ-M taker fees and funding cash flows (needed for shorts)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--mlflow-uri", default="http://localhost:5001")
     p.add_argument("--run-name", default="lgbm-baseline")
+    p.add_argument("--split", choices=("dev", "holdout", "all"), default="dev",
+                   help=f"dev (default) trains on data before {HOLDOUT_START.date()}; "
+                        "holdout is the final check and needs --i-am-done-tuning")
+    p.add_argument("--i-am-done-tuning", action="store_true",
+                   help="required to run against the holdout. The flag is the point: "
+                        "the holdout is only worth anything while it is untouched, so "
+                        "spending it should be a decision, not a typo")
     args = p.parse_args()
+
+    if args.split == "holdout" and not args.i_am_done_tuning:
+        p.error(
+            f"--split holdout evaluates the reserved period from {HOLDOUT_START.date()} "
+            "onward. Every run against it spends it — there is no second untouched "
+            "tail. Pass --i-am-done-tuning if that is really what you want."
+        )
+
+    if args.side == "short" and args.venue != "perp":
+        p.error("spot cannot short — use --venue perp")
 
     setup_logging(settings.log_level)
     symbols = [s.strip() for s in args.symbols.split(",")]
-    spec = BarrierSpec(args.upper, args.lower, args.max_bars)
+    spec = BarrierSpec(args.upper, args.lower, args.max_bars,
+                       side=SHORT if args.side == "short" else LONG)
+    costs = costs_for(args.venue)
 
-    ds, _, panel, sigma = build_dataset(symbols, args.interval, Path(args.cache_dir), spec)
-    log.info("dataset: %d events, %d features, effective n=%.0f",
-             len(ds), ds.X.shape[1], ds.weight.sum())
+    ds, bar_times, panel, sigma = build_dataset(
+        symbols, args.interval, Path(args.cache_dir), spec, split=args.split)
+    funding = None
+    if args.venue == PERP:
+        funding = funding_settlements(bar_times, symbols, Path(args.cache_dir))
+        if funding is None:
+            p.error("perp venue needs funding snapshots — run `python -m gs_training.datasets`")
+    log.info("dataset[%s]: %d events, %d features, effective n=%.0f",
+             args.split, len(ds), ds.X.shape[1], ds.weight.sum())
+    if args.split == "holdout":
+        log.warning("RUNNING ON THE HOLDOUT — record this run; the tail is now spent")
 
     results = train_walk_forward(ds, panel, sigma, spec, n_splits=args.splits,
-                                 ev_threshold=args.ev_threshold, seed=args.seed)
+                                 ev_threshold=args.ev_threshold, costs=costs,
+                                 seed=args.seed, funding=funding)
     summary = aggregate(results)
 
     print(f"\n{'fold':>4} {'train':>8} {'test':>7} {'auc':>6} {'signals':>8} "
@@ -386,7 +513,11 @@ def main() -> None:
         "symbols": args.symbols, "interval": args.interval, "splits": args.splits,
         "upper_mult": args.upper, "lower_mult": args.lower, "max_bars": args.max_bars,
         "ev_threshold": args.ev_threshold, "seed": args.seed,
+        "side": args.side, "venue": args.venue, "fee_rate": costs.fee_rate,
         "n_events": len(ds), "effective_n": round(float(ds.weight.sum())),
+        # Logged on every run so a holdout evaluation is identifiable in MLflow
+        # forever, rather than resting on whoever ran it remembering.
+        "split": args.split, "holdout_start": HOLDOUT_START.date().isoformat(),
     }, results, summary)
 
 

@@ -12,8 +12,18 @@ What is modelled, all pessimistically:
   a bar's close and filling at that same close is not achievable.
 - **Exits via `labels.scan_barriers`** — the identical function that defined the
   training label, so the backtest scores the strategy the model was trained for.
-- **Taker fees both ways.** Spot is 0.1% per side by default; PLAN.md's target
-  of paying maker on entry is an optimisation to prove later, not to assume now.
+- **Taker fees both ways.** Spot is 0.1% per side by default, USDⓈ-M perps
+  0.05% (`CostModel.perp()`); PLAN.md's target of paying maker on entry is an
+  optimisation to prove later, not to assume now.
+- **Shorts, on perps only.** A position is collateralised at 1x — no leverage —
+  so a short ties up the same capital as a long of the same notional and the two
+  are directly comparable. Slippage always works against the trade: a short
+  sells to enter and buys to exit.
+- **Funding, on perps only.** Each 8-hourly settlement a position is held across
+  pays `side·rate·notional` (a positive rate charges longs and credits shorts).
+  It is booked to cash on the settlement bar, so equity carries it as it accrues
+  rather than as a lump at exit. Perp prices are approximated by spot klines —
+  the archive has no perp OHLC, and the basis is a few bps on these symbols.
 - **Position and concurrency caps**, so a signal arriving with no free slot is
   skipped rather than silently taken.
 
@@ -24,11 +34,14 @@ labels describe, and the skip count is how that shows up.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from .labels import LOSS, TIMEOUT, UNRESOLVED, WIN, BarrierSpec, scan_barriers
+from .labels import LONG, LOSS, SHORT, TIMEOUT, UNRESOLVED, WIN, BarrierSpec, scan_barriers
+
+SPOT = "spot"
+PERP = "perp"
 
 
 @dataclass(frozen=True)
@@ -37,6 +50,22 @@ class CostModel:
 
     fee_rate: float = 0.001        # per side, 0.1% taker
     slippage_bps: float = 5.0      # each way, on top of the fill price
+    venue: str = SPOT              # "spot" (long-only) or "perp" (both sides, funding)
+
+    def __post_init__(self) -> None:
+        if self.venue not in (SPOT, PERP):
+            raise ValueError(f"venue must be {SPOT!r} or {PERP!r}, got {self.venue!r}")
+
+    @classmethod
+    def perp(cls, fee_rate: float = 0.0005, slippage_bps: float = 5.0) -> "CostModel":
+        """Binance USDⓈ-M perpetual, taker (non-VIP, no BNB discount)."""
+        return cls(fee_rate=fee_rate, slippage_bps=slippage_bps, venue=PERP)
+
+    def entry_price(self, px: float, side: int) -> float:
+        return self.buy_price(px) if side == LONG else self.sell_price(px)
+
+    def exit_price(self, px: float, side: int) -> float:
+        return self.sell_price(px) if side == LONG else self.buy_price(px)
 
     def buy_price(self, px: float) -> float:
         return px * (1.0 + self.slippage_bps / 10_000.0)
@@ -62,14 +91,16 @@ class Trade:
     qty: float
     outcome: int
     fees: float
+    side: int = LONG
+    funding: float = 0.0           # net funding received (+) or paid (−), perps only
 
     @property
     def pnl(self) -> float:
-        return (self.exit_px - self.entry_px) * self.qty - self.fees
+        return self.side * (self.exit_px - self.entry_px) * self.qty - self.fees + self.funding
 
     @property
     def gross_return(self) -> float:
-        return self.exit_px / self.entry_px - 1.0
+        return self.side * (self.exit_px / self.entry_px - 1.0)
 
 
 @dataclass
@@ -87,10 +118,15 @@ class BacktestResult:
 
 @dataclass(frozen=True)
 class Signal:
-    """A decision to enter, taken at the close of bar `bar`."""
+    """A decision to enter, taken at the close of bar `bar`.
+
+    `side=None` takes the side of the `BarrierSpec` the backtest runs with, so a
+    short spec cannot be paired with signals that silently trade long.
+    """
 
     bar: int
     symbol: str
+    side: int | None = None
 
 
 def run_backtest(
@@ -100,13 +136,26 @@ def run_backtest(
     sigma: dict[str, np.ndarray],
     costs: CostModel = CostModel(),
     portfolio: Portfolio = Portfolio(),
+    funding: dict[str, np.ndarray] | None = None,
 ) -> BacktestResult:
     """Simulate `signals` over aligned per-symbol OHLC series.
 
     `bars[symbol]` holds equal-length `open/high/low/close` arrays on a shared
     bar grid (index `i` is the same instant for every symbol). `sigma[symbol]`
     is the volatility estimate used to size barriers, read at the *signal* bar.
+
+    `funding[symbol]` is the rate settled on each bar (0 where none settles —
+    see `datasets.funding_settlements`). Required on the perp venue and refused
+    on spot: a perp backtest without funding is optimistic for longs in exactly
+    the periods funding is highest, and that should not happen by omission.
     """
+    if costs.venue == PERP and funding is None:
+        raise ValueError("perp venue needs funding settlements")
+    if costs.venue == SPOT and funding is not None:
+        raise ValueError("spot positions pay no funding; pass funding only for perps")
+    # One spec per side, sharing every other parameter: the geometry is the
+    # same, only its direction changes.
+    specs = {LONG: replace(spec, side=LONG), SHORT: replace(spec, side=SHORT)}
     if not bars:
         return BacktestResult(starting_cash=portfolio.starting_cash)
     n_bars = len(next(iter(bars.values()))["close"])
@@ -125,12 +174,24 @@ def run_backtest(
     equity = np.full(n_bars, np.nan)
 
     for i in range(n_bars):
+        # 0. Funding settles at this bar's open for positions held across it.
+        #    The exit happens later in the bar, so the exit bar settles too; the
+        #    entry bar does not (entry and settlement share the open — call it
+        #    not held, which is neutral rather than favourable to either side).
+        if funding is not None:
+            for t in open_trades:
+                rate = funding[t.symbol][i]
+                if rate:
+                    flow = -t.side * rate * t.qty * float(bars[t.symbol]["open"][i])
+                    t.funding += flow
+                    cash += flow
+
         # 1. Close anything whose barrier resolved on this bar, freeing capital
         #    before new entries are considered.
         still_open = []
         for t in open_trades:
             if t.exit_i == i:
-                cash += t.exit_px * t.qty * (1.0 - costs.fee_rate)
+                cash += _settle(t, costs)
                 result.trades.append(t)
             else:
                 still_open.append(t)
@@ -144,42 +205,52 @@ def run_backtest(
             if cash < notional:
                 result.skipped_no_cash += 1
                 continue
+            side = spec.side if sig.side is None else sig.side
+            if side == SHORT and costs.venue != PERP:
+                raise ValueError("spot cannot short; use CostModel.perp()")
+            sp = specs[side]
             b = bars[sig.symbol]
             s = sigma[sig.symbol][sig.bar]
             if not np.isfinite(s) or s <= 0:
                 continue
             raw_entry = float(b["open"][i])
-            entry_px = costs.buy_price(raw_entry)
+            entry_px = costs.entry_price(raw_entry, side)
             # Same geometry the labeller used — one definition, no drift.
-            up_px, dn_px = spec.barrier_prices(raw_entry, s)
+            target_px, stop_px = sp.barrier_prices(raw_entry, s)
             outcome, exit_i, exit_raw = scan_barriers(
                 b["open"], b["high"], b["low"], b["close"],
-                i, raw_entry, up_px, dn_px, spec.max_bars,
+                i, raw_entry, target_px, stop_px, sp.max_bars, side,
             )
             if outcome == UNRESOLVED:
                 continue  # not enough forward data left in this segment
             qty = notional / entry_px
             entry_fee = entry_px * qty * costs.fee_rate
-            exit_px = costs.sell_price(float(exit_raw))
+            exit_px = costs.exit_price(float(exit_raw), side)
             exit_fee = exit_px * qty * costs.fee_rate
-            cash -= entry_px * qty * (1.0 + costs.fee_rate)
+            # Collateral (the full notional, 1x) plus the entry fee leave cash.
+            cash -= entry_px * qty + entry_fee
             trade = Trade(
                 symbol=sig.symbol, entry_i=i, exit_i=exit_i,
                 entry_px=entry_px, exit_px=exit_px, qty=qty,
-                outcome=outcome, fees=entry_fee + exit_fee,
+                outcome=outcome, fees=entry_fee + exit_fee, side=side,
             )
             if exit_i == i:
                 # Resolved within its own entry bar. Step 1 already ran for this
                 # bar, so leaving it to the next iteration would never close it:
                 # it would hold capital to the end of the run and leak into
                 # equity as an unrealised mark that never becomes P&L.
-                cash += exit_px * qty * (1.0 - costs.fee_rate)
+                cash += _settle(trade, costs)
                 result.trades.append(trade)
             else:
                 open_trades.append(trade)
 
-        # 3. Mark to market.
-        held = sum(float(bars[t.symbol]["close"][i]) * t.qty for t in open_trades)
+        # 3. Mark to market: collateral plus unrealised P&L. For a long this is
+        #    exactly close·qty; funding is already in cash.
+        held = sum(
+            t.entry_px * t.qty
+            + t.side * (float(bars[t.symbol]["close"][i]) - t.entry_px) * t.qty
+            for t in open_trades
+        )
         equity[i] = cash + held
 
     # `scan_barriers` only resolves trades whose exit lands inside the series,
@@ -192,6 +263,17 @@ def run_backtest(
         )
     result.equity = equity
     return result
+
+
+def _settle(t: Trade, costs: CostModel) -> float:
+    """Cash returned at exit: collateral + price P&L − exit fee.
+
+    The entry fee left cash at entry and funding moved on its settlement bars,
+    so neither is repeated here. For a long this reduces to
+    `exit_px·qty·(1 − fee)`, the spot sale proceeds.
+    """
+    exit_fee = t.exit_px * t.qty * costs.fee_rate
+    return t.entry_px * t.qty + t.side * (t.exit_px - t.entry_px) * t.qty - exit_fee
 
 
 def summarize(result: BacktestResult) -> dict[str, float]:
@@ -209,6 +291,7 @@ def summarize(result: BacktestResult) -> dict[str, float]:
         "hit_rate": float(len(wins) / len(trades)) if trades else 0.0,
         "total_pnl": float(pnl.sum()),
         "total_fees": float(sum(t.fees for t in trades)),
+        "total_funding": float(sum(t.funding for t in trades)),
         "avg_pnl": float(pnl.mean()) if trades else 0.0,
         "final_equity": result.final_equity,
         "total_return": (result.final_equity / result.starting_cash - 1.0)

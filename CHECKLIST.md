@@ -381,8 +381,74 @@ what ~1,456 effectively independent samples buys.
       image: `--allowed-hosts` (Host-header validation is on by default and rejects
       everything with no useful error) and `--workers 1` (four workers OOM-crashloop
       in colima's ~2GB VM; the container reported "Up 3 seconds" on every check).
-- [ ] Untouched final holdout period reserved — **not yet done**, and it should be
-      before any serious tuning starts: every experiment against these folds burns them.
+- [x] **Untouched final holdout reserved** (2026-09-22) — `HOLDOUT_START = 2025-10-01`
+      in [splits.py](training/gs_training/splits.py), with `holdout_split` and a
+      `--split {dev,holdout,all}` flag on `gs-train` that defaults to `dev`. Done before
+      any tuning, which is the only time it can be done honestly: walk-forward folds are
+      reusable, so each experiment scored against them spends a little of their
+      credibility, and after twenty variants the winner is partly a fit to the folds.
+      Three things make it a real reservation rather than a naming convention:
+      · **The boundary is purged, not just cut.** Development keeps only events whose
+        *label has fully resolved* before the cut. An event decided five days early with
+        a 14-day horizon resolves inside the holdout, so training on it leaks exactly the
+        period being reserved. The purged band belongs to neither side and is reported
+        rather than silently assigned — 585 events on the 2026-09-22 snapshot, the
+        price of the guarantee.
+      · **`dev` is the default**, because the safe thing has to be what happens when
+        nobody thought about it. `--split holdout` additionally demands
+        `--i-am-done-tuning`, and `split` + `holdout_start` are logged as MLflow params
+        on *every* run, so a holdout evaluation stays identifiable years later instead of
+        resting on whoever ran it remembering.
+      · The panel and sigma are still returned whole — a holdout trade opened near the
+        boundary resolves on bars belonging to neither side, and the backtester marks to
+        market across a position's full life. Only the *event rows* are partitioned,
+        which is where the leak would be.
+      Measured on the 2026-09-22 snapshot (50,146 1h bars, 2021-01-01 .. 2026-09-21):
+      79,295 events split **65,757 development** (effective n 1,210, 29.4% win) ·
+      585 purged at the boundary · **12,953 holdout** (effective n 247, 20.4% win),
+      spanning 2025-10-01 .. 2026-09-07. Read the effective numbers, not the row
+      counts: the holdout is ~25 non-overlapping 14-day windows per symbol, so it can
+      refute a strategy but cannot finely rank two that both survive. The win rate
+      falling from 29.4% to 20.4% across the boundary is the regime difference showing
+      up in the labels, not a bug.
+      Known limitation, recorded so it is not rediscovered as a surprise: a chronological
+      holdout can only ever contain the most recent regime, and this one is a drawdown
+      (2025 closed −31% median across the basket, 2026 −8% so far, BTC −40% peak to
+      trough). It tests whether a long-only model correctly **abstains**, not whether it
+      captures upside. Passing it is necessary, not sufficient.
+- [x] **Long vs short compared — shorting is not the better trade** (2026-10-08),
+      `python -m gs_training.compare_sides --combined`, development data only (no flag
+      exists to point it at the holdout: that tail is a drawdown, so it is exactly where a
+      peek at shorts would be most tempting). Shorts are modelled as USDⓈ-M perps at 1x —
+      0.05% taker vs spot's 0.1%, funding booked per settlement from the archive — and
+      priced off spot klines, since the archive has no perp OHLC (basis is a few bps).
+      `BarrierSpec.side` mirrors the barriers by running the long scan on the negated
+      series, so a short inherits every pessimism rule with no second copy to drift.
+      Long-spot inside the comparison reproduces `gs-train` exactly (13,655 signals,
+      −6.4% mean fold return).
+      · **Label level, every event, perp costs:** long **+0.61%** net per event, short
+        **−0.77%**. Shorts are positive in exactly one year (2022, +0.76%) and flat in
+        2025; funding pays them +0.16%/event on average and still does not close the gap.
+        Hit rate 23.7% for shorts vs 29.4% for longs, against a ~33% breakeven on 1:0.5
+        geometry.
+      · **The intuitive rule is backwards.** With BTC *below* its 200-day SMA, shorts
+        lose *more* (−1.06%/event) and longs earn *most* (+1.21%). On a 14-day horizon,
+        below-trend bars are where sharp bounces happen, and a 0.5σ stop above entry is
+        what they hit. "Short only in bear regimes" does not work with these barriers.
+      · **Model level (5 folds):** long-spot −6.4% mean, long-perp −9.4% (funding cost
+        longs −908 over the run — cheaper fees do not compensate), short-perp −9.9% over
+        3 traded folds and **abstained** in the other two, including fold 0
+        (2021-10 → 2022-08), the bear. The short model ranks better (mean AUC 0.58 vs
+        0.52, 0.66 in fold 1) and beats its same-side random band in 3/3 traded folds,
+        but only by losing less than random shorts (which lose 27–45% in folds 1–2):
+        model hit rate 18.8%, every traded fold negative, PF 0.76–0.95.
+      · **Combined portfolio** (both perp models, shared 5 slots): worse than either side
+        alone in 3 of 5 folds (fold 2: −35.7%). Slots, not signals, are the binding
+        constraint — >90% of signals skipped in most folds.
+      Conclusion: no side has an edge yet; the long-side problem is the model, the
+      short-side problem is the market's drift and the stop geometry. PLAN.md's
+      "long-only" stays. If shorts are revisited, the honest next question is barrier
+      geometry for shorts (a wider stop), and every variant tried spends the folds.
 - [x] **Docker context trap, hit and documented** (2026-08-23): this repo's active
       context is a *remote* machine, so a bare `docker compose up -d` in `training/`
       started MLflow **on the Raspberry Pi**. It looked like it worked — container up,

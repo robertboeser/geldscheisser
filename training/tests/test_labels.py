@@ -5,7 +5,9 @@ import numpy as np
 import pytest
 
 from gs_training.labels import (
+    LONG,
     LOSS,
+    SHORT,
     TIMEOUT,
     UNRESOLVED,
     WIN,
@@ -64,6 +66,67 @@ class TestScanBarriers:
     def test_insufficient_forward_data_is_unresolved_not_timeout(self):
         o, h, l, c = series([100, 101])
         assert scan_barriers(o, h, l, c, 0, 100, 110, 90, 10)[0] == UNRESOLVED
+
+
+class TestShortBarriers:
+    """A short is the long scan on the negated series, so each pessimism rule
+    must reappear mirrored: target below, stop above, same-bar = loss, gap up
+    through the stop fills at the (higher) open."""
+
+    def test_lower_target_first_is_a_win(self):
+        o, h, l, c = series([100, 99, 90, 100])
+        assert scan_barriers(o, h, l, c, 0, 100, 95, 105, 4, SHORT) == (WIN, 2, 95.0)
+
+    def test_upper_stop_first_is_a_loss(self):
+        o, h, l, c = series([100, 101, 104, 100], highs=[100, 101, 110, 100])
+        assert scan_barriers(o, h, l, c, 0, 100, 95, 105, 4, SHORT) == (LOSS, 2, 105.0)
+
+    def test_same_bar_touching_both_barriers_is_a_loss(self):
+        o, h, l, c = series([100], highs=[110], lows=[90], opens=[100])
+        outcome, _, px = scan_barriers(o, h, l, c, 0, 100, 95, 105, 1, SHORT)
+        assert outcome == LOSS and px == 105.0
+
+    def test_gap_up_through_the_stop_fills_at_the_open(self):
+        o, h, l, c = series([120], highs=[125], lows=[118], opens=[120])
+        outcome, _, px = scan_barriers(o, h, l, c, 0, 100, 95, 105, 1, SHORT)
+        assert outcome == LOSS and px == 120.0, "must fill at the gapped open"
+
+    def test_gap_down_through_the_target_still_fills_at_the_target(self):
+        o, h, l, c = series([80], highs=[82], lows=[78], opens=[80])
+        outcome, _, px = scan_barriers(o, h, l, c, 0, 100, 95, 105, 1, SHORT)
+        assert outcome == WIN and px == 95.0
+
+    def test_timeout_and_unresolved_match_the_long_rules(self):
+        o, h, l, c = series([100, 101, 99, 102])
+        assert scan_barriers(o, h, l, c, 0, 100, 90, 110, 4, SHORT) == (TIMEOUT, 3, 102.0)
+        assert scan_barriers(o, h, l, c, 0, 100, 90, 110, 10, SHORT)[0] == UNRESOLVED
+
+    def test_short_equals_long_on_the_negated_series(self):
+        rng = np.random.default_rng(3)
+        c = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, 300)))
+        o = np.r_[c[0], c[:-1]] * np.exp(rng.normal(0, 0.005, 300))
+        h = np.maximum(o, c) * (1 + rng.uniform(0, 0.01, 300))
+        l = np.minimum(o, c) * (1 - rng.uniform(0, 0.01, 300))
+        for e in range(0, 250, 7):
+            short = scan_barriers(o, h, l, c, e, o[e], o[e] * 0.95, o[e] * 1.03, 40, SHORT)
+            long_ = scan_barriers(-o, -l, -h, -c, e, -o[e], -o[e] * 0.95, -o[e] * 1.03, 40, LONG)
+            assert short[:2] == long_[:2] and short[2] == pytest.approx(-long_[2])
+
+    def test_barrier_prices_flip_for_a_short(self):
+        spec = BarrierSpec(1.0, 0.5, 100, side=SHORT)
+        target, stop = spec.barrier_prices(100.0, 0.01)       # horizon sigma 0.10
+        assert target == pytest.approx(90.0) and stop == pytest.approx(105.0)
+
+    def test_rejects_an_unknown_side(self):
+        with pytest.raises(ValueError, match="side"):
+            BarrierSpec(side=0)
+
+    def test_short_label_return_is_positive_when_price_falls(self):
+        o, h, l, c = series([100, 100, 80, 80, 80, 80], opens=[100] * 2 + [80] * 4)
+        out = label_events(o, h, l, c, np.full(6, 0.10), np.array([0]),
+                           BarrierSpec(1, 0.5, 4, scale_by_horizon=False, side=SHORT))
+        assert out["outcome"][0] == WIN
+        assert out["ret"][0] == pytest.approx(0.10)
 
 
 class TestLabelEvents:

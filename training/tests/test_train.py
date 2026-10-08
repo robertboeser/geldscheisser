@@ -4,7 +4,14 @@ import numpy as np
 import pytest
 
 from gs_training.labels import BarrierSpec
-from gs_training.train import Dataset, aggregate, expected_value, slice_panel
+from gs_training.splits import HOLDOUT_START
+from gs_training.train import (
+    Dataset,
+    aggregate,
+    expected_value,
+    holdout_bar,
+    slice_panel,
+)
 
 
 class TestExpectedValue:
@@ -75,6 +82,56 @@ class TestDataset:
                      dn_ret=np.full(n, 0.05))
         assert len(ds) == n
 
+    def test_select_keeps_every_parallel_array_in_step(self):
+        n = 10
+        ds = Dataset(X=np.arange(n * 3.0).reshape(n, 3), y=np.arange(n) % 2,
+                     event_bar=np.arange(n), label_end_bar=np.arange(n) + 10,
+                     weight=np.linspace(0.1, 1.0, n),
+                     symbol=np.array([f"S{i}" for i in range(n)]),
+                     up_ret=np.arange(n) / 100.0, dn_ret=np.arange(n) / 200.0)
+        keep = np.array([True, False] * 5)
+        sub = ds.select(keep)
+        assert len(sub) == 5
+        for field in ("y", "event_bar", "label_end_bar", "weight", "symbol",
+                      "up_ret", "dn_ret"):
+            assert np.array_equal(getattr(sub, field), getattr(ds, field)[keep])
+        assert np.array_equal(sub.X, ds.X[keep])
+
+    def test_select_does_not_recompute_uniqueness(self):
+        """Dropping an event's neighbours from the matrix does not make it more
+        independent than it was — the weight must survive the subset unchanged."""
+        n = 6
+        w = np.linspace(0.01, 0.06, n)
+        ds = Dataset(X=np.zeros((n, 2)), y=np.zeros(n), event_bar=np.arange(n),
+                     label_end_bar=np.arange(n) + 5, weight=w,
+                     symbol=np.full(n, "BTCUSDT"), up_ret=np.full(n, 0.1),
+                     dn_ret=np.full(n, 0.05))
+        sub = ds.select(np.array([True, False, False, False, False, True]))
+        assert np.array_equal(sub.weight, np.array([w[0], w[-1]]))
+
+
+class TestHoldoutBar:
+    """The date -> bar-index conversion the training CLI hangs off."""
+
+    def _grid(self, start, n):
+        t0 = np.datetime64(start, "h")
+        return (t0 + np.arange(n) * np.timedelta64(1, "h")).astype("datetime64[ns]")
+
+    def test_locates_the_first_bar_at_or_after_the_cut(self):
+        bars = self._grid("2025-09-30T00", 96)   # 4 days of hourly bars
+        i = int(holdout_bar(bars))
+        assert bars[i] == np.datetime64(HOLDOUT_START.replace(tzinfo=None), "ns")
+        assert bars[i - 1] < np.datetime64("2025-10-01T00:00:00", "ns")
+
+    def test_cache_ending_before_the_cut_gives_an_empty_holdout(self):
+        """A stale cache must produce no holdout rather than a mislabelled one."""
+        bars = self._grid("2024-01-01T00", 100)
+        assert int(holdout_bar(bars)) == len(bars)
+
+    def test_grid_starting_after_the_cut_reserves_everything(self):
+        bars = self._grid("2026-01-01T00", 100)
+        assert int(holdout_bar(bars)) == 0
+
 
 class TestAbstention:
     """A fold that emits no signal has abstained. Scoring that as a 0% return
@@ -106,3 +163,18 @@ class TestAbstention:
         rs = [self._fold(0, 0.1, 0.0, 10, pf=float("inf")),
               self._fold(1, 0.2, 0.0, 10, pf=2.0)]
         assert np.isfinite(aggregate(rs)["mean_profit_factor"])
+
+
+class TestSideCli:
+    def test_short_on_spot_is_rejected_before_any_work(self, monkeypatch, capsys):
+        import sys
+        from gs_training import train
+        monkeypatch.setattr(sys, "argv", ["gs-train", "--side", "short", "--venue", "spot"])
+        with pytest.raises(SystemExit):
+            train.main()
+        assert "spot cannot short" in capsys.readouterr().err
+
+    def test_costs_for_venue(self):
+        from gs_training.train import costs_for
+        assert costs_for("perp").venue == "perp" and costs_for("perp").fee_rate == 0.0005
+        assert costs_for("spot").venue == "spot" and costs_for("spot").fee_rate == 0.001

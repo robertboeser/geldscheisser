@@ -22,8 +22,12 @@ Conventions that matter, all of them chosen to be pessimistic:
   the target still fill at the target. The asymmetry is intentional: real
   adverse gaps cost more than the stop, favourable ones rarely pay extra.
 
-Spot is long-only, so everything here is a long position: the upper barrier is
-the profit target, the lower is the stop.
+**Sides.** `BarrierSpec.side` is +1 for a long (spot or perp) and -1 for a
+short (perp only — spot cannot short). A short is resolved by running the long
+scan on the price series negated, so every pessimism rule above applies to it by
+construction rather than through a second copy that could drift: for a short the
+stop sits *above* entry, a same-bar double touch is still a loss, and a gap up
+through the stop fills at the (higher) open.
 """
 
 from __future__ import annotations
@@ -42,6 +46,9 @@ TIMEOUT = 0
 # was hit" when the window was merely truncated is a fabricated observation.
 UNRESOLVED = -2
 
+LONG = 1
+SHORT = -1
+
 
 @dataclass(frozen=True)
 class BarrierSpec:
@@ -59,25 +66,33 @@ class BarrierSpec:
     the labels then describe a scalping strategy, not a swing one.
     """
 
-    upper_mult: float = 1.0   # profit target, k·sigma_horizon above entry
-    lower_mult: float = 0.5   # stop, k·sigma_horizon below entry
+    upper_mult: float = 1.0   # profit target, k·sigma_horizon in the trade's favour
+    lower_mult: float = 0.5   # stop, k·sigma_horizon against the trade
     max_bars: int = 336       # vertical barrier (336 1h bars = 14 days)
     scale_by_horizon: bool = True
+    side: int = LONG          # +1 long, -1 short
 
     def __post_init__(self) -> None:
         if self.upper_mult <= 0 or self.lower_mult <= 0:
             raise ValueError("barrier multiples must be positive")
         if self.max_bars < 1:
             raise ValueError("max_bars must be at least 1")
+        if self.side not in (LONG, SHORT):
+            raise ValueError(f"side must be {LONG} or {SHORT}, got {self.side!r}")
 
     def horizon_sigma(self, sigma: float) -> float:
         """Per-bar volatility scaled to the holding period."""
         return sigma * math.sqrt(self.max_bars) if self.scale_by_horizon else sigma
 
     def barrier_prices(self, entry_px: float, sigma: float) -> tuple[float, float]:
-        """(upper, lower) absolute prices for a long entered at `entry_px`."""
+        """(target, stop) absolute prices for a position entered at `entry_px`.
+
+        For a long that is (upper, lower); for a short the target is below
+        entry and the stop above it.
+        """
         s = self.horizon_sigma(sigma)
-        return entry_px * (1.0 + self.upper_mult * s), entry_px * (1.0 - self.lower_mult * s)
+        return (entry_px * (1.0 + self.side * self.upper_mult * s),
+                entry_px * (1.0 - self.side * self.lower_mult * s))
 
 
 def ewm_volatility(close: np.ndarray, span: int = 100) -> np.ndarray:
@@ -109,12 +124,26 @@ def ewm_volatility(close: np.ndarray, span: int = 100) -> np.ndarray:
 def scan_barriers(
     open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray,
     entry_i: int, entry_px: float, up_px: float, dn_px: float, max_bars: int,
+    side: int = LONG,
 ) -> tuple[int, int, float]:
-    """Resolve one long position opened at `entry_px` on bar `entry_i`.
+    """Resolve one position opened at `entry_px` on bar `entry_i`.
 
-    Returns `(outcome, exit_i, exit_px)`. Scanning starts at `entry_i` itself:
-    entry is at that bar's open, so the rest of that bar can already resolve it.
+    `up_px`/`dn_px` are the (target, stop) pair from `barrier_prices` — for a
+    short the target is the lower of the two. Returns `(outcome, exit_i,
+    exit_px)`. Scanning starts at `entry_i` itself: entry is at that bar's open,
+    so the rest of that bar can already resolve it.
+
+    A short is the long scan on the negated series: negation swaps high and low,
+    so "high >= target" becomes "low <= target" and the gap-through-stop rule
+    becomes "open above the stop fills at the open". One code path, one set of
+    pessimism rules.
     """
+    if side == SHORT:
+        outcome, exit_i, px = scan_barriers(
+            -open_, -low, -high, -close, entry_i, -entry_px, -up_px, -dn_px, max_bars)
+        return outcome, exit_i, -px
+    if side != LONG:
+        raise ValueError(f"side must be {LONG} or {SHORT}, got {side!r}")
     n = close.size
     if entry_i >= n:
         return UNRESOLVED, -1, np.nan
@@ -150,7 +179,8 @@ def label_events(
     """Label decision bars `event_idx`; entry is the *next* bar's open.
 
     Returns arrays aligned with `event_idx`: `outcome`, `entry_idx`, `exit_idx`,
-    `entry_px`, `exit_px`, `ret` (gross, fees are the backtester's business) and
+    `entry_px`, `exit_px`, `ret` (gross and signed by `spec.side`, so a
+    profitable short is positive; fees are the backtester's business) and
     `label_end_idx` — the last bar each label depends on, which is what the
     purged walk-forward split needs to prevent leakage.
     """
@@ -176,7 +206,8 @@ def label_events(
         entry_px = float(open_[entry_i])
         up_px, dn_px = spec.barrier_prices(entry_px, s)
         outcome, exit_i, exit_px = scan_barriers(
-            open_, high, low, close, entry_i, entry_px, up_px, dn_px, spec.max_bars
+            open_, high, low, close, entry_i, entry_px, up_px, dn_px, spec.max_bars,
+            spec.side,
         )
         if outcome == UNRESOLVED:
             continue
@@ -185,7 +216,7 @@ def label_events(
         out["exit_idx"][j] = exit_i
         out["entry_px"][j] = entry_px
         out["exit_px"][j] = exit_px
-        out["ret"][j] = exit_px / entry_px - 1.0
+        out["ret"][j] = spec.side * (exit_px / entry_px - 1.0)
         # The label is only *known* once the whole window has passed, even when
         # a barrier resolved it early: at decision time you could not have known
         # it would. Purging must assume the full horizon.

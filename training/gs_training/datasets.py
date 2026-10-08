@@ -218,6 +218,49 @@ def align_funding(
     return out
 
 
+def funding_settlements(
+    bar_times: np.ndarray,
+    symbols: list[str],
+    cache_dir: Path = DEFAULT_CACHE,
+) -> dict[str, np.ndarray] | None:
+    """Funding *cash flows* on the bar grid: the rate on the bar each settlement
+    falls in, 0 on every other bar.
+
+    Not the same thing as `align_funding`, which is a feature — the rate in
+    force at each bar, known to a model. This is what a perp position actually
+    pays or receives, so it must land once per settlement and nowhere else;
+    smearing it across bars would charge it eight times.
+
+    A settlement is placed on the bar whose `[open_time, open_time + bar)` span
+    contains it, so timestamps a few ms off the hour still land on the right
+    bar. One that falls in a bar missing from the panel (an outage dropped by
+    the inner join) is dropped rather than moved to a neighbour — the
+    backtester has no price for it either way. Settlement cadence is whatever
+    the data says (some symbols spent periods on 4h funding), not assumed 8h.
+
+    Returns None when any symbol lacks a snapshot, for the same reason as
+    `align_funding`.
+    """
+    bar_times = np.asarray(bar_times)
+    if bar_times.size < 2:
+        raise ValueError("need at least two bars to infer the bar length")
+    bar_len = np.median(np.diff(bar_times))
+    out: dict[str, np.ndarray] = {}
+    for symbol in symbols:
+        if not _funding_path(Path(cache_dir), symbol).exists():
+            return None
+        df = load_funding(symbol, cache_dir)
+        flows = np.zeros(bar_times.size)
+        if df.height:
+            ft = _as_naive_utc(df["funding_time"].to_list())
+            rate = df["rate"].to_numpy().astype(float)
+            idx = np.searchsorted(bar_times, ft, side="right") - 1
+            inside = (idx >= 0) & (ft - bar_times[np.clip(idx, 0, None)] < bar_len)
+            np.add.at(flows, idx[inside], rate[inside])
+        out[symbol] = flows
+    return out
+
+
 async def _main() -> None:
     import argparse
 

@@ -21,11 +21,18 @@ because their features have lookback that reaches back into it.
 Purge length is not a parameter: it is derived per-sample from `label_end`, so a
 variable horizon (an early barrier touch, a shorter series) is handled exactly
 rather than approximated by a fixed window.
+
+Walk-forward alone is not enough. Its folds are reusable, so every experiment
+scored against them spends a little of their credibility — run twenty variants
+and the best one is partly a fit to the folds themselves. `HOLDOUT_START` and
+`holdout_split` reserve a final block that nothing but the very last check may
+touch; see the constant for which block and why.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -171,3 +178,55 @@ def average_uniqueness(label_end: np.ndarray, event_time: np.ndarray) -> np.ndar
         c = c[c > 0]
         out[j] = float(np.mean(1.0 / c)) if c.size else 0.0
     return out
+
+
+# The final holdout: everything from this instant onward is reserved and must
+# not inform model selection. It is a constant rather than a CLI default because
+# a holdout you can move is not a holdout — the whole value is that it was fixed
+# before the experiments that would otherwise be tempted to move it.
+#
+# Chosen 2026-09-22, when the archive ran 2021-01-01 .. 2026-09-22 on 1h bars:
+# it reserves the most recent ~12 months (~26 non-overlapping 14-day windows per
+# symbol) while leaving ~4.75 years of development data. The tail is the right
+# place for it — it is the only split that answers the question live trading
+# asks, "does this work on data that did not exist when the model was designed".
+#
+# Known limitation, stated here so it is not rediscovered as a surprise: a
+# chronological holdout can only ever contain the most recent regime. This one
+# is a drawdown (2025 closed −31% median across the basket, 2026 is −8% so far
+# with BTC −40% peak-to-trough), so it tests whether a long-only model correctly
+# *abstains*, not whether it captures upside. Passing it is necessary, not
+# sufficient.
+HOLDOUT_START = datetime(2025, 10, 1, tzinfo=timezone.utc)
+
+
+def holdout_split(
+    event_time: np.ndarray,
+    label_end: np.ndarray,
+    holdout_start: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Partition events into (development, holdout) masks at `holdout_start`.
+
+    Units follow `walk_forward`: anything orderable, normally a bar index.
+
+    Development keeps only events whose label has **fully resolved** before the
+    holdout begins. That is the same purge rule `walk_forward` applies between
+    folds, for the same reason — an event decided five days before the boundary
+    with a 14-day horizon resolves *inside* the holdout, so fitting on it leaks
+    the very period being reserved, and the holdout stops being untouched.
+
+    The two masks deliberately do **not** cover every event: those in the purged
+    band belong to neither. Returning them as a gap rather than assigning them
+    to a side is the point, and `n_purged = len(event_time) - dev.sum() -
+    hold.sum()` is worth logging so the cost stays visible.
+    """
+    event_time = np.asarray(event_time)
+    label_end = np.asarray(label_end)
+    if event_time.shape != label_end.shape:
+        raise ValueError("event_time and label_end must be the same length")
+
+    hold = event_time >= holdout_start
+    # Not `~hold`: an event before the boundary whose label reaches past it is
+    # in neither set.
+    dev = label_end < holdout_start
+    return dev, hold

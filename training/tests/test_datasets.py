@@ -19,6 +19,7 @@ from gs_training.datasets import (
     KLINE_COLUMNS,
     PANEL_COLUMNS,
     align_funding,
+    funding_settlements,
     load_panel,
 )
 
@@ -130,3 +131,37 @@ class TestFundingAlignment:
         _write_klines(tmp_path, "BBBUSDT", "1h")
         _write_funding(tmp_path, "AAAUSDT", [datetime(2024, 1, 1, tzinfo=timezone.utc)], [0.001])
         assert align_funding(self._grid(), ["AAAUSDT", "BBBUSDT"], tmp_path) is None
+
+
+class TestFundingSettlements:
+    """Cash flows, not features: each print lands on exactly one bar."""
+
+    def _grid(self, n=24):
+        t0 = np.datetime64("2024-01-01T00:00:00")
+        return t0 + np.arange(n) * np.timedelta64(1, "h")
+
+    def test_rate_lands_only_on_its_settlement_bar(self, tmp_path):
+        t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        _write_funding(tmp_path, "AAAUSDT",
+                       [t0, t0 + timedelta(hours=8), t0 + timedelta(hours=16)],
+                       [0.001, -0.002, 0.003])
+        got = funding_settlements(self._grid(), ["AAAUSDT"], tmp_path)["AAAUSDT"]
+        assert np.flatnonzero(got).tolist() == [0, 8, 16]
+        assert got[[0, 8, 16]] == pytest.approx([0.001, -0.002, 0.003])
+        assert got.sum() == pytest.approx(0.002), "summing must not multiply-count"
+
+    def test_millisecond_offsets_still_land_on_the_hour_bar(self, tmp_path):
+        t = datetime(2024, 1, 1, 8, 0, 0, 3000, tzinfo=timezone.utc)
+        _write_funding(tmp_path, "AAAUSDT", [t], [0.001])
+        got = funding_settlements(self._grid(), ["AAAUSDT"], tmp_path)["AAAUSDT"]
+        assert np.flatnonzero(got).tolist() == [8]
+
+    def test_settlement_in_a_missing_bar_is_dropped_not_moved(self, tmp_path):
+        grid = np.delete(self._grid(), 8)          # outage: the 08:00 bar is gone
+        t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        _write_funding(tmp_path, "AAAUSDT", [t0 + timedelta(hours=8)], [0.001])
+        got = funding_settlements(grid, ["AAAUSDT"], tmp_path)["AAAUSDT"]
+        assert not got.any()
+
+    def test_missing_snapshot_returns_none(self, tmp_path):
+        assert funding_settlements(self._grid(), ["AAAUSDT"], tmp_path) is None
